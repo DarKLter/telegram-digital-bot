@@ -13,6 +13,12 @@ from flask import Flask, request, jsonify
 
 from telegram import (
     Update,
+    User,
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -96,7 +102,7 @@ DEFAULT_TENANT_CONFIG: Dict[str, Any] = {
             "Welcome **{name}** to **{shop_name}**!\n\n"
             "ℹ️ **ACCESS POLICY & RULES:**\n"
             "• **Members:** You are permitted to use `/start` (to checkout) and `/help` (for instructions).\n"
-            "• **Admins & Owners:** Store & hub controls (`/setup`, `/admin`, `/sethub`, `/setindex`, `/reload`, etc.) are locked to verified Administrators and can ONLY be run inside Bot Private DM or your configured SetAdmin group.\n\n"
+            "• **Admins & Owners:** Store & hub controls (`/setup`, `/admin`, `/sethub`, `/setindex`, `/reload`, etc.) are locked to verified Administrators and can be run in Bot Private DM or your configured SetAdmin group/channel. In a channel, any admin who can publish posts can run commands because Telegram does not identify the individual poster; commands and replies are visible to channel subscribers. Do not enter passwords, API keys, or other secrets in channel commands. Add the bot as a channel administrator, then set it up with `/setadmin <channel_id>` in Bot Private DM.\n\n"
             "─── 🛒 **STEP-BY-STEP PURCHASING GUIDE** ───\n"
             "1️⃣ **Start Checkout:** Type `/start` in private DM.\n"
             "2️⃣ **Select Payment Method:** Choose GCash, Maya, Bank Transfer, or Crypto.\n"
@@ -836,6 +842,218 @@ def get_tenant_by_chat(chat_id: int) -> Tuple[Optional[int], Optional[Dict[str, 
     primary_id = get_primary_admin_id()
     return primary_id, get_tenant_config(primary_id)
 
+
+def get_admin_channel_owner(chat_id: int) -> Optional[int]:
+    mapped_owner = normalize_chat_id(
+        GLOBAL_CONFIG.get("chat_tenant_map", {}).get(str(chat_id))
+    )
+    if mapped_owner is not None:
+        tenant_cfg = get_tenant_config(mapped_owner)
+        if normalize_chat_id(tenant_cfg.get("admin_proof_group_id")) == chat_id:
+            return mapped_owner
+
+    for owner_str, tenant_cfg in GLOBAL_CONFIG.get("tenants", {}).items():
+        if normalize_chat_id(tenant_cfg.get("admin_proof_group_id")) == chat_id:
+            return normalize_chat_id(owner_str)
+    return None
+
+
+class ChannelCommandUpdate(Update):
+    def __init__(self, update: Update, actor: User):
+        super().__init__(update.update_id, channel_post=update.channel_post)
+        # Channel posts omit the human author; only trusted Admin channels get this tenant actor.
+        self._channel_command_actor = actor
+
+    @property
+    def effective_user(self) -> Optional[User]:
+        return self._channel_command_actor
+
+
+PUBLIC_BOT_COMMANDS = [
+    BotCommand("start", "Open the store"),
+    BotCommand("help", "Show usage instructions"),
+    BotCommand("search", "Search files"),
+    BotCommand("find", "Search files"),
+    BotCommand("courses", "Browse courses"),
+    BotCommand("course", "Browse courses"),
+    BotCommand("videos", "Browse videos"),
+    BotCommand("video", "Browse videos"),
+    BotCommand("ebooks", "Browse e-books"),
+    BotCommand("ebook", "Browse e-books"),
+    BotCommand("pdfs", "Browse PDFs"),
+    BotCommand("pdf", "Browse PDFs"),
+    BotCommand("vaultstats", "Show vault statistics"),
+    BotCommand("ai", "Ask the AI"),
+    BotCommand("ask", "Ask the AI"),
+]
+
+ADMIN_BOT_COMMANDS = [
+    BotCommand("setup", "Open the setup wizard"),
+    BotCommand("setting", "Open the setup wizard"),
+    BotCommand("settings", "Open the setup wizard"),
+    BotCommand("admin", "Open the admin panel"),
+    BotCommand("setadminid", "Set the administrator ID"),
+    BotCommand("adminid", "Set the administrator ID"),
+    BotCommand("reload", "Reload settings"),
+    BotCommand("showlog", "View system logs"),
+    BotCommand("logs", "View system logs"),
+    BotCommand("log", "View system logs"),
+    BotCommand("clearlogs", "Clear system logs"),
+    BotCommand("syncsettings", "Sync room settings"),
+    BotCommand("syncall", "Sync room settings"),
+    BotCommand("checkrooms", "Check connected rooms"),
+    BotCommand("grantlicense", "Grant a bot license"),
+    BotCommand("revokelicense", "Revoke a bot license"),
+    BotCommand("setlicenseprice", "Set the bot license price"),
+    BotCommand("setai", "Configure the AI provider"),
+    BotCommand("setaiprompt", "Set AI instructions"),
+    BotCommand("setaiinstructions", "Set AI instructions"),
+    BotCommand("setpersona", "Set AI instructions"),
+    BotCommand("setaimodel", "Set the AI model"),
+    BotCommand("aitoggle", "Enable or disable the AI"),
+    BotCommand("aistatus", "Show AI status"),
+    BotCommand("aicontrol", "Show AI status"),
+    BotCommand("viewuser", "View a user"),
+    BotCommand("viewtenant", "View a tenant"),
+    BotCommand("viewstore", "View a tenant"),
+    BotCommand("allusers", "List users"),
+    BotCommand("alltenants", "List tenants"),
+    BotCommand("tenantfiles", "List tenant files"),
+    BotCommand("masteraudit", "View master audit logs"),
+    BotCommand("spyactivity", "View master audit logs"),
+    BotCommand("clonebot", "Connect a cloned bot"),
+    BotCommand("setclonetoken", "Connect a cloned bot"),
+    BotCommand("newbot", "Connect a cloned bot"),
+    BotCommand("mybot", "View your cloned bot"),
+    BotCommand("allclones", "List cloned bots"),
+    BotCommand("spyclone", "Inspect a cloned bot"),
+    BotCommand("stopclone", "Stop a cloned bot"),
+    BotCommand("startclone", "Start a cloned bot"),
+    BotCommand("delclone", "Delete a cloned bot"),
+    BotCommand("setowner", "Set the store owner"),
+    BotCommand("addcoowner", "Add a co-owner"),
+    BotCommand("delcoowner", "Remove a co-owner"),
+    BotCommand("renameowner", "Rename the store owner"),
+    BotCommand("shopname", "Set the store name"),
+    BotCommand("setshopname", "Set the store name"),
+    BotCommand("setindex", "Register or manage an index vault"),
+    BotCommand("unsetindex", "Remove an index vault"),
+    BotCommand("delindexroom", "Remove an index vault"),
+    BotCommand("sethub", "Set the main directory"),
+    BotCommand("unsethub", "Remove the main directory"),
+    BotCommand("delhub", "Remove the main directory"),
+    BotCommand("setadmin", "Set the Admin group or channel"),
+    BotCommand("unsetadmin", "Remove the Admin group or channel"),
+    BotCommand("deladmin", "Remove the Admin group or channel"),
+    BotCommand("setproof", "Set the proof archive"),
+    BotCommand("unsetproof", "Remove the proof archive"),
+    BotCommand("delproof", "Remove the proof archive"),
+    BotCommand("viewvault", "Browse vault contents"),
+    BotCommand("openlink", "Open a file link"),
+    BotCommand("customindex", "Configure index labels"),
+    BotCommand("setindexlabel", "Set the index label"),
+    BotCommand("groupmodule", "Manage a file module"),
+    BotCommand("renameitem", "Rename an indexed item"),
+    BotCommand("delindex", "Delete indexed files"),
+    BotCommand("setbotname", "Set the bot name"),
+    BotCommand("setbotusername", "Set the bot username"),
+    BotCommand("setpayment", "Set a payment method"),
+    BotCommand("addpayment", "Add a payment method"),
+    BotCommand("delpayment", "Delete a payment method"),
+    BotCommand("setmsg", "Set a store message"),
+    BotCommand("promote", "Promote an administrator"),
+    BotCommand("config", "View configuration"),
+    BotCommand("addbadword", "Add a moderation word"),
+]
+
+CHANNEL_ADMIN_COMMAND_NAMES = {
+    command.command for command in ADMIN_BOT_COMMANDS
+}
+
+
+async def register_admin_chat_command_menu(bot, chat_id: int) -> None:
+    try:
+        chat = await bot.get_chat(chat_id)
+        if chat.type == "channel":
+            await bot.set_my_commands(
+                ADMIN_BOT_COMMANDS,
+                scope=BotCommandScopeChat(chat_id),
+            )
+    except TelegramError as exc:
+        logger.error(
+            "Could not register command menu for Admin chat %s: %s",
+            chat_id,
+            exc,
+        )
+
+
+async def register_bot_command_menus(bot, owner_id: Optional[int] = None) -> None:
+    admin_commands = PUBLIC_BOT_COMMANDS + ADMIN_BOT_COMMANDS
+    try:
+        await bot.set_my_commands(
+            PUBLIC_BOT_COMMANDS,
+            scope=BotCommandScopeAllGroupChats(),
+        )
+        await bot.set_my_commands(
+            ADMIN_BOT_COMMANDS,
+            scope=BotCommandScopeAllChatAdministrators(),
+        )
+        await bot.set_my_commands(
+            admin_commands,
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+    except TelegramError as exc:
+        logger.error("Could not register Telegram command menus: %s", exc)
+        return
+
+    tenants = GLOBAL_CONFIG.get("tenants", {})
+    if owner_id is not None:
+        tenants = {str(owner_id): tenants.get(str(owner_id), {})}
+
+    admin_channel_ids = {
+        chat_id
+        for tenant_cfg in tenants.values()
+        if (chat_id := normalize_chat_id(tenant_cfg.get("admin_proof_group_id")))
+    }
+    for chat_id in admin_channel_ids:
+        await register_admin_chat_command_menu(bot, chat_id)
+
+
+def make_channel_admin_command(callback):
+    async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        chat = update.effective_chat
+        if not message or not chat or chat.type != "channel" or update.effective_user:
+            await callback(update, context)
+            return
+
+        text = message.text or ""
+        command = text.split(maxsplit=1)[0].split("@", 1)[0].lstrip("/").lower()
+        if command not in CHANNEL_ADMIN_COMMAND_NAMES:
+            await message.reply_text("This command is only available in private chats or groups.")
+            return
+
+        owner_id = get_admin_channel_owner(chat.id)
+        if owner_id is None:
+            await message.reply_text(
+                "This channel is not configured as your Admin channel yet.\n"
+                f"Channel ID: `{chat.id}`\n"
+                f"In the bot's private chat, run `/setadmin {chat.id}`. "
+                "After setup, channel admins who can publish posts can use admin commands here.",
+                parse_mode="Markdown",
+            )
+            return
+
+        channel_actor = User(
+            id=owner_id,
+            first_name="Configured channel admin",
+            is_bot=False,
+        )
+        await callback(ChannelCommandUpdate(update, channel_actor), context)
+
+    return handle_command
+
+
 def get_target_admin_destinations(owner_id: int, client_id: int) -> List[int]:
     """
     CRITICAL USER SPECIFICATION:
@@ -982,7 +1200,7 @@ async def check_settings_permission_or_reply(
     1. User must be a Licensed Tenant or Bot Owner (deploying bot is not free).
     2. Settings changes, edits, or updates of any group or channel are ONLY allowed:
        - Inside Bot Private DM
-       - Inside the configured SetAdmin room (Admin Verification Group)
+       - Inside the configured SetAdmin room (Admin Verification Group or Channel)
     """
     msg = update.effective_message
     user = update.effective_user
@@ -1040,7 +1258,7 @@ async def check_settings_permission_or_reply(
     if chat.type == "private":
         return True
 
-    # Rule B: Inside the configured SetAdmin room (Admin Verification Group) is ALWAYS allowed
+    # Rule B: Inside the configured SetAdmin group or channel is ALWAYS allowed
     if admin_group_id and int(chat.id) == int(admin_group_id):
         return True
 
@@ -1050,12 +1268,12 @@ async def check_settings_permission_or_reply(
 
     # Otherwise: Block settings changes in any other room!
     bot_info = await context.bot.get_me()
-    admin_group_info = f"`{admin_group_id}`" if admin_group_id else "Not registered yet (run `/setadmin` here or in DM)"
+    admin_group_info = f"`{admin_group_id}`" if admin_group_id else "Not registered yet (run `/setadmin` in DM)"
     warning_text = (
         f"⛔ **SETTINGS EDIT RESTRICTED!**\n\n"
         f"For security, group/channel settings can **ONLY be edited or updated inside:**\n"
         f"1️⃣ **Bot Private DM** ([@{bot_info.username}](https://t.me/{bot_info.username}))\n"
-        f"2️⃣ Your registered **Admin Verification Group (`/setadmin`)**\n\n"
+        f"2️⃣ Your registered **Admin Verification Group or Channel (`/setadmin`)**\n\n"
         f"📍 **Current Room:** `{chat.title}` (`{chat.id}`)\n"
         f"🛡️ **SetAdmin Room:** {admin_group_info}\n\n"
         f"👉 _Please open private DM with @{bot_info.username} or run this inside your SetAdmin room._"
@@ -3212,9 +3430,10 @@ async def set_admin_group_command(update: Update, context: ContextTypes.DEFAULT_
     tenant_cfg["admin_proof_group_id"] = target_chat_id
     GLOBAL_CONFIG.setdefault("chat_tenant_map", {})[str(target_chat_id)] = owner_id
     save_config(GLOBAL_CONFIG)
+    await register_admin_chat_command_menu(context.bot, target_chat_id)
     log_system_event("BIND_ADMIN", f"Admin verification group registered to {target_chat_id}", chat_id=target_chat_id, user_id=user.id, status="SUCCESS")
     await msg.reply_text(
-        f"✅ **REAL-TIME SUCCESS!** Group `{target_chat_id}` registered as **ADMIN VERIFICATION GROUP**!\n\n"
+        f"✅ **REAL-TIME SUCCESS!** Chat `{target_chat_id}` registered as **ADMIN VERIFICATION GROUP/CHANNEL**!\n\n"
         "💡 _To unbind later, type `/setadmin remove`._",
         parse_mode="Markdown",
     )
@@ -5602,6 +5821,11 @@ def register_all_handlers(app: Application, is_clone: bool = False, clone_owner_
         group=3,
     )
 
+    for handler_group in app.handlers.values():
+        for handler in handler_group:
+            if isinstance(handler, CommandHandler):
+                handler.callback = make_channel_admin_command(handler.callback)
+
 async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = True) -> Tuple[bool, str, dict]:
     """
     Spawns an autonomous cloned bot instance using the customer's BotFather token.
@@ -5621,6 +5845,7 @@ async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = T
         register_all_handlers(clone_app, is_clone=True, clone_owner_id=owner_id)
 
         await clone_app.initialize()
+        await register_bot_command_menus(clone_app.bot, owner_id=owner_id)
         await clone_app.start()
 
         me = await clone_app.bot.get_me()
@@ -5985,6 +6210,7 @@ loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
 loop.run_until_complete(bot_app.initialize())
+loop.run_until_complete(register_bot_command_menus(bot_app.bot))
 loop.run_until_complete(bot_app.start())
 
 # Auto-register Webhook on Render.com for Main Bot
