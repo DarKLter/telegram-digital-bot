@@ -203,6 +203,7 @@ DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
     },
     "tenants": {},
     "chat_tenant_map": {},
+    "cloned_bots": {},
 }
 
 NOTIFIED_ROOMS_CACHE: Set[int] = set()
@@ -543,6 +544,31 @@ def db_search_files(query_term: str, limit: int = 15) -> List[Dict[str, Any]]:
         logger.error(f"Database search error: {e}")
         return []
 
+def db_search_files_by_type(query_term: str = "", file_type: str = "", limit: int = 15) -> List[Dict[str, Any]]:
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        conditions = []
+        params = []
+        if file_type:
+            conditions.append("file_type = ?")
+            params.append(file_type)
+        if query_term.strip():
+            term = f"%{query_term.strip()}%"
+            conditions.append("(file_name LIKE ? OR caption LIKE ? OR module_title LIKE ? OR category_name LIKE ?)")
+            params.extend([term, term, term, term])
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"SELECT * FROM indexed_files {where_clause} ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        cursor.execute(query, tuple(params))
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"Database search by type error: {e}")
+        return []
+
 def db_get_stats(chat_id: Optional[int] = None) -> Dict[str, int]:
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -613,6 +639,7 @@ def load_config() -> Dict[str, Any]:
                 data = json.load(f)
                 data.setdefault("tenants", {})
                 data.setdefault("chat_tenant_map", {})
+                data.setdefault("cloned_bots", {})
                 data.setdefault("primary_admin_id", PRIMARY_ADMIN_TELEGRAM_ID)
                 data.setdefault("primary_store_owner_id", PRIMARY_ADMIN_TELEGRAM_ID)
                 data.setdefault("super_admin_ids", SUPER_ADMIN_IDS)
@@ -738,36 +765,37 @@ def get_tenant_by_chat(chat_id: int) -> Tuple[Optional[int], Optional[Dict[str, 
 
 def get_target_admin_destinations(owner_id: int, client_id: int) -> List[int]:
     """
-    CRITICAL FIX: Strictly routes receipts, screenshots, and Approve/Reject action cards
-    to the configured Admin Telegram ID and Admin Verification Group.
-    Explicitly removes client_id to prevent the buyer from ever receiving approve/reject controls.
+    CRITICAL USER SPECIFICATION:
+    Payment accept/reject are automatically sent to setadmin (admin_proof_group_id).
+    If setadmin is NOT set, automatically send to the bot DM (the store owner / primary_owner_id).
+    Client ID is NEVER included so buyer never receives approval controls!
     """
     destinations: List[int] = []
     tenant_cfg = get_tenant_config(owner_id)
 
+    # Priority 1: If setadmin group is configured, send directly to setadmin!
     admin_group = tenant_cfg.get("admin_proof_group_id")
     if admin_group and int(admin_group) != 0 and int(admin_group) != client_id:
         destinations.append(int(admin_group))
+        return destinations
 
+    # Priority 2: If setadmin is NOT set, route to the bot DM (admin_telegram_id or primary_owner_id)
     admin_dm_id = tenant_cfg.get("admin_telegram_id")
     if admin_dm_id and int(admin_dm_id) != 0 and int(admin_dm_id) != client_id:
-        if int(admin_dm_id) not in destinations:
-            destinations.append(int(admin_dm_id))
+        destinations.append(int(admin_dm_id))
 
     store_owner = tenant_cfg.get("primary_owner_id", owner_id)
     if store_owner and int(store_owner) != 0 and int(store_owner) != client_id:
         if int(store_owner) not in destinations:
             destinations.append(int(store_owner))
 
-    global_admin = get_primary_admin_id()
-    if global_admin != client_id and global_admin not in destinations:
-        destinations.append(global_admin)
-
-    for sa_id in SUPER_ADMIN_IDS:
-        if sa_id != client_id and sa_id not in destinations:
-            destinations.append(sa_id)
+    if not destinations:
+        global_admin = get_primary_admin_id()
+        if global_admin != client_id:
+            destinations.append(global_admin)
 
     return destinations
+
 
 async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
@@ -888,7 +916,17 @@ async def check_settings_permission_or_reply(
 
     user_id = user.id
 
-    # 1. Commercial License Verification (NOT FREE to use in own group/channel)
+    # 1. Super Admin (Real Bot Owner) is NEVER blocked anywhere
+    if is_super_admin(user_id):
+        return True
+
+    # 2. Informational / Read-only commands can be viewed by any admin/owner in any room or DM
+    view_only_commands = ["admin", "help", "viewvault", "vaultstats", "aistatus", "config", "openlink", "search", "courses", "videos", "ebooks", "mybot"]
+    if command_name.lower() in view_only_commands:
+        if await is_admin_or_owner(update, context):
+            return True
+
+    # 3. Commercial License Verification (NOT FREE to use in own group/channel)
     if not is_user_licensed(user_id):
         price = GLOBAL_CONFIG.get("bot_license_pricing", DEFAULT_GLOBAL_CONFIG["bot_license_pricing"])
         lock_text = (
@@ -901,7 +939,8 @@ async def check_settings_permission_or_reply(
             "• Auto-indexing all ebooks, videos, APKs & software\n"
             "• Branded store checkout with your GCash, Maya & Bank\n"
             "• Single-use hub invites & fraud detection\n"
-            "• Full step-by-step setup guide and admin dashboard!\n\n"
+            "• Full step-by-step setup guide and admin dashboard!\n"
+            "• Autonomous Bot Cloning engine (@BotFather style)\n\n"
             "👉 _Click '💳 Buy Bot License' below to purchase and activate full access._"
         )
         keyboard = [
@@ -912,7 +951,7 @@ async def check_settings_permission_or_reply(
         log_system_event("UNLICENSED_ACCESS_ATTEMPT", f"User {user_id} tried /{command_name} without license", chat_id=chat.id, user_id=user_id, status="WARN")
         return False
 
-    # 2. Administrator or Owner Status check
+    # 4. Administrator or Owner Status check
     if not await is_admin_or_owner(update, context):
         await msg.reply_text("⛔ **Access Denied:** Administrator or Owner permission required.", parse_mode="Markdown")
         log_system_event("AUTH_DENIED", f"User {user_id} denied on /{command_name}", chat_id=chat.id, user_id=user_id, status="WARN")
@@ -929,8 +968,8 @@ async def check_settings_permission_or_reply(
     if admin_group_id and int(chat.id) == int(admin_group_id):
         return True
 
-    # Rule C: Allow /setadmin initially in a new group so an admin can bind that group
-    if allow_initial_setadmin and (admin_group_id == 0 or is_super_admin(user_id)):
+    # Rule C: Allow /setadmin in any group so an admin can bind or update that group
+    if allow_initial_setadmin:
         return True
 
     # Otherwise: Block settings changes in any other room!
@@ -2240,28 +2279,69 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         try:
-            invite_link = await context.bot.create_chat_invite_link(chat_id=int(main_hub_id), member_limit=1)
+            # 1. Fetch Hub chat to distinguish Public vs Private
+            hub_chat = None
+            try:
+                hub_chat = await context.bot.get_chat(int(main_hub_id))
+            except Exception as chat_err:
+                logger.warning(f"Could not fetch hub chat info for {main_hub_id}: {chat_err}")
+
+            join_link = None
+            is_public = False
+
+            if hub_chat and hub_chat.username:
+                # PUBLIC Hub Channel or Group
+                join_link = f"https://t.me/{hub_chat.username}"
+                is_public = True
+            else:
+                # PRIVATE Hub Channel or Group -> Generate single-use invite link or export fallback
+                try:
+                    invite_link = await context.bot.create_chat_invite_link(chat_id=int(main_hub_id), member_limit=1)
+                    join_link = invite_link.invite_link
+                except Exception as inv_err:
+                    logger.warning(f"create_chat_invite_link failed, trying export_chat_invite_link: {inv_err}")
+                    try:
+                        join_link = await context.bot.export_chat_invite_link(chat_id=int(main_hub_id))
+                    except Exception as exp_err:
+                        logger.error(f"Failed exporting chat invite link for {main_hub_id}: {exp_err}")
+
+            # 2. Lift any bans / restrictions on buyer and approve pending join requests
+            try:
+                await context.bot.unban_chat_member(chat_id=int(main_hub_id), user_id=buyer_id, only_if_banned=True)
+            except Exception:
+                pass
+
+            try:
+                await context.bot.approve_chat_join_request(chat_id=int(main_hub_id), user_id=buyer_id)
+            except Exception:
+                pass
+
+            hub_title = hub_chat.title if hub_chat and hub_chat.title else tenant_cfg.get('shop_name', 'Digital Vault Hub')
+            link_display = f"👉 **Access Hub Link:**\n{join_link}" if join_link else "👉 _Access has been granted! Check the group or channel._"
+
             await context.bot.send_message(
                 chat_id=buyer_id,
                 text=(
                     f"🎉 **PAYMENT APPROVED!**\n\n"
-                    f"Welcome to **{tenant_cfg.get('shop_name', 'Digital Vault')}**!\n\n"
-                    f"👉 **Your Single-Use Invite Link:**\n{invite_link.invite_link}\n\n"
-                    f"⚠️ _Expires after 1 use. Click to join the Main Directory Hub._"
+                    f"Welcome to **{hub_title}**!\n\n"
+                    f"{link_display}\n\n"
+                    f"📌 **Hub Type:** {'Public Hub' if is_public else 'Private Vault (Single-Use Link)'}\n"
+                    f"💡 _You can now search and access all courses, videos, ebooks, and indexed vault files!_"
                 ),
+                disable_web_page_preview=False,
             )
             original_text = query.message.caption or query.message.text or ""
             approved_text = (
                 f"{original_text}\n\n"
                 f"✅ **STATUS: APPROVED BY {admin_user.full_name}** (`{admin_user.id}`)\n"
-                f"🔗 Single-use link: `{invite_link.invite_link}`"
+                f"🔗 Access Link: `{join_link or 'Auto-Unbanned'}` ({'Public' if is_public else 'Private'})"
             )
             if query.message.photo:
                 await query.edit_message_caption(caption=approved_text, reply_markup=None)
             else:
                 await query.edit_message_text(text=approved_text, reply_markup=None)
 
-            log_system_event("PAYMENT_APPROVED", f"Admin {admin_user.id} approved buyer {buyer_id}", user_id=admin_user.id, status="SUCCESS")
+            log_system_event("PAYMENT_APPROVED", f"Admin {admin_user.id} approved buyer {buyer_id} for hub {main_hub_id} ({'public' if is_public else 'private'})", user_id=admin_user.id, status="SUCCESS")
 
             if proof_archive_id and int(proof_archive_id) != 0:
                 try:
@@ -2275,7 +2355,7 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
 
         except Exception as e:
             logger.error(f"Approval execution error: {e}")
-            await query.message.reply_text(f"❌ Error creating invite link: {e}")
+            await query.message.reply_text(f"❌ Error granting access: {e}")
 
     elif action == "reject":
         try:
@@ -2717,6 +2797,78 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply_text += "👉 _Click any link above to open directly in Telegram!_"
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text=reply_text, parse_mode="Markdown", disable_web_page_preview=True)
+
+async def courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Rapid course & video series finder for SetHub and DM.
+    Usage: /courses [keyword]
+    """
+    msg = update.effective_message
+    if not msg:
+        return
+    query_term = " ".join(context.args).strip() if context.args else ""
+    results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12)
+    if not results:
+        results = db_search_files(query_term or "course", limit=12)
+
+    if not results:
+        await msg.reply_text("🎓 No video courses found. Try `/search <topic>` or check back soon!", parse_mode="Markdown")
+        return
+
+    heading = f"🎓 **VIDEO COURSES & MODULES**" + (f" FOR: `{query_term}`" if query_term else " (Latest)")
+    lines = [f"{heading}\n────────────────────────────────────────\n"]
+    for item in results:
+        title = item.get("module_title") or item.get("file_name") or item.get("caption") or "Course Lesson"
+        clean_title = title.split("\n")[0][:45]
+        cat = item.get("category_name", "Course Vault")
+        link = item.get("direct_link", "#")
+        lines.append(f"🎬 **[{clean_title}]({link})**\n   📁 _{cat}_\n")
+    lines.append("👉 _Click any course link above to open directly in Telegram!_")
+    await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Browse indexed videos in SetHub.
+    Usage: /videos [keyword]
+    """
+    msg = update.effective_message
+    if not msg:
+        return
+    query_term = " ".join(context.args).strip() if context.args else ""
+    results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12)
+    if not results:
+        await msg.reply_text("🎬 No videos found matching your query.", parse_mode="Markdown")
+        return
+    lines = [f"🎬 **INDEXED VIDEOS**" + (f" FOR: `{query_term}`" if query_term else " (Latest)") + "\n────────────────────────────────────────\n"]
+    for item in results:
+        title = item.get("file_name") or item.get("caption") or "Video File"
+        clean_title = title.split("\n")[0][:45]
+        link = item.get("direct_link", "#")
+        lines.append(f"▶️ **[{clean_title}]({link})**\n   📁 _{item.get('category_name', 'Vault')}_\n")
+    lines.append("👉 _Click any link to stream/view in Telegram!_")
+    await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+async def ebooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Browse indexed ebooks & PDF documents in SetHub.
+    Usage: /ebooks [keyword]
+    """
+    msg = update.effective_message
+    if not msg:
+        return
+    query_term = " ".join(context.args).strip() if context.args else ""
+    results = db_search_files_by_type(query_term=query_term, file_type="ebook", limit=12)
+    if not results:
+        await msg.reply_text("📚 No ebooks found matching your query.", parse_mode="Markdown")
+        return
+    lines = [f"📚 **E-BOOKS & PDF GUIDES**" + (f" FOR: `{query_term}`" if query_term else " (Latest)") + "\n────────────────────────────────────────\n"]
+    for item in results:
+        title = item.get("file_name") or item.get("caption") or "E-Book Document"
+        clean_title = title.split("\n")[0][:45]
+        link = item.get("direct_link", "#")
+        lines.append(f"📖 **[{clean_title}]({link})**\n   📁 _{item.get('category_name', 'Library')}_\n")
+    lines.append("👉 _Click any link to read/download in Telegram!_")
+    await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 async def vault_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -3472,12 +3624,18 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/aistatus` - View AI status, provider, model & token stats\n"
         "• `/ai <question>` | `/ask <question>` - Ask AI brain anything\n"
         "• Mentioning @bot_username or replying in groups triggers autonomous AI replies!\n\n"
+        "🤖 **Bot Cloning Engine (@BotFather Style):**\n"
+        "• `/clonebot <TOKEN>` (or `/setclonetoken`) - Spawn dedicated bot clone with your token\n"
+        "• `/mybot` - View your cloned bot status & webhook health\n\n"
         "🕵️ **Master Owner Surveillance (Real Owner Only):**\n"
         "• `/viewuser <user_id|@username>` - Inspect user contact, phone, email & rooms\n"
         "• `/viewtenant <owner_id>` - Spy on another tenant's store, rooms & vaults\n"
         "• `/allusers [limit]` - List all captured users with phone & email\n"
         "• `/alltenants` - List all commercial store owners & managers\n"
         "• `/tenantfiles <id>` - Inspect files uploaded by a tenant or room\n"
+        "• `/allclones` - List all cloned bots and activity metrics\n"
+        "• `/spyclone <owner_id|@username>` - Deep spy audit of clone settings & actions\n"
+        "• `/stopclone <owner_id>` | `/startclone <owner_id>` | `/delclone <owner_id>` - Manage clones\n"
         "• `/masteraudit` - Master global audit & real-time surveillance dashboard"
     )
     await msg.reply_text(admin_help_text, parse_mode="Markdown")
@@ -4910,149 +5068,537 @@ async def master_audit_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await msg.reply_text("\n".join(audit_lines), parse_mode="Markdown")
 
+# ================= CLONED BOT MULTI-TENANT ENGINE (@BotFather Style) =================
+
+CLONED_BOT_APPS: Dict[str, Application] = {}  # token -> Application
+CLONED_BOT_INFO: Dict[str, dict] = {}          # token -> metadata dict
+
+def register_all_handlers(app: Application, is_clone: bool = False, clone_owner_id: int = 0):
+    """
+    Registers the complete suite of commands, callbacks, and message listeners
+    on either the Main Bot Application or any Cloned Bot Application.
+    """
+    # 1. Customer Commands
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", member_help_command))
+    app.add_handler(CommandHandler(["search", "find"], search_command))
+    app.add_handler(CommandHandler(["courses", "course"], courses_command))
+    app.add_handler(CommandHandler(["videos", "video"], videos_command))
+    app.add_handler(CommandHandler(["ebooks", "ebook", "pdfs", "pdf"], ebooks_command))
+    app.add_handler(CommandHandler("vaultstats", vault_stats_command))
+    app.add_handler(CommandHandler(["ai", "ask"], ask_ai_command))
+
+    # 2. Administration & Setup Commands
+    app.add_handler(CommandHandler(["setup", "setting", "settings"], setup_wizard_command))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler(["setadminid", "adminid"], set_admin_id_command))
+
+    # 3. Reload, Logs & Multi-Room Sync Commands
+    app.add_handler(CommandHandler("reload", reload_command))
+    app.add_handler(CommandHandler(["showlog", "logs", "log"], show_log_command))
+    app.add_handler(CommandHandler("clearlogs", clear_logs_command))
+    app.add_handler(CommandHandler(["syncsettings", "syncall", "checkrooms"], sync_settings_command))
+
+    # 4. Commercial Bot License Real Owner Commands
+    app.add_handler(CommandHandler("grantlicense", grant_license_command))
+    app.add_handler(CommandHandler("revokelicense", revoke_license_command))
+    app.add_handler(CommandHandler("setlicenseprice", set_license_price_command))
+
+    # 5. AI Brain Configuration Commands
+    app.add_handler(CommandHandler("setai", set_ai_command))
+    app.add_handler(CommandHandler(["setaiprompt", "setaiinstructions", "setpersona"], set_ai_prompt_command))
+    app.add_handler(CommandHandler("setaimodel", set_ai_model_command))
+    app.add_handler(CommandHandler("aitoggle", ai_toggle_command))
+    app.add_handler(CommandHandler(["aistatus", "aicontrol"], ai_status_command))
+
+    # 6. Real Owner Master Surveillance & Inspector Suite Commands
+    app.add_handler(CommandHandler("viewuser", master_view_user_command))
+    app.add_handler(CommandHandler(["viewtenant", "viewstore"], master_view_tenant_command))
+    app.add_handler(CommandHandler("allusers", master_all_users_command))
+    app.add_handler(CommandHandler("alltenants", master_all_tenants_command))
+    app.add_handler(CommandHandler("tenantfiles", master_tenant_files_command))
+    app.add_handler(CommandHandler(["masteraudit", "spyactivity"], master_audit_command))
+
+    # 7. Cloned Bot Lifecycle & Surveillance Commands
+    app.add_handler(CommandHandler(["clonebot", "setclonetoken", "newbot"], clone_bot_command))
+    app.add_handler(CommandHandler("mybot", my_bot_command))
+    app.add_handler(CommandHandler("allclones", master_all_clones_command))
+    app.add_handler(CommandHandler("spyclone", master_spy_clone_command))
+    app.add_handler(CommandHandler("stopclone", master_stop_clone_command))
+    app.add_handler(CommandHandler("startclone", master_start_clone_command))
+    app.add_handler(CommandHandler("delclone", master_del_clone_command))
+
+    # 8. User ID & Store Configuration Commands
+    app.add_handler(CommandHandler("setowner", set_owner_command))
+    app.add_handler(CommandHandler("addcoowner", add_coowner_command))
+    app.add_handler(CommandHandler("delcoowner", del_coowner_command))
+    app.add_handler(CommandHandler("renameowner", rename_owner_command))
+    app.add_handler(CommandHandler(["shopname", "setshopname"], set_shop_name_command))
+
+    # 9. Multi-Tenant Room Binding Commands (with remove support)
+    app.add_handler(CommandHandler(["setindex", "unsetindex", "delindexroom"], set_index_command))
+    app.add_handler(CommandHandler(["sethub", "unsethub", "delhub"], set_hub_command))
+    app.add_handler(CommandHandler(["setadmin", "unsetadmin", "deladmin"], set_admin_group_command))
+    app.add_handler(CommandHandler(["setproof", "unsetproof", "delproof"], set_proof_archive_command))
+
+    # 10. File, Jump Link & Index Customization Commands
+    app.add_handler(CommandHandler("viewvault", view_vault_command))
+    app.add_handler(CommandHandler("openlink", open_link_command))
+    app.add_handler(CommandHandler("customindex", custom_index_panel))
+    app.add_handler(CommandHandler("setindexlabel", set_index_label_command))
+    app.add_handler(CommandHandler("groupmodule", group_module_command))
+    app.add_handler(CommandHandler("renameitem", rename_item_command))
+    app.add_handler(CommandHandler("delindex", del_index_command))
+
+    # 11. Bot Profile Commands
+    app.add_handler(CommandHandler("setbotname", set_bot_name_command))
+    app.add_handler(CommandHandler("setbotusername", set_bot_username_command))
+
+    # 12. Payments & Custom Messaging Commands
+    app.add_handler(CommandHandler("setpayment", set_payment_command))
+    app.add_handler(CommandHandler("addpayment", add_payment_command))
+    app.add_handler(CommandHandler("delpayment", del_payment_command))
+    app.add_handler(CommandHandler("setmsg", set_msg_command))
+    app.add_handler(CommandHandler("promote", promote_command))
+    app.add_handler(CommandHandler("config", view_config_command))
+    app.add_handler(CommandHandler("addbadword", add_bad_word_command))
+
+    # 13. Interactive Callback Handlers
+    app.add_handler(CallbackQueryHandler(handle_setup_callbacks, pattern="^setup_"))
+    app.add_handler(CallbackQueryHandler(handle_bind_room_callback, pattern="^bindroom_"))
+    app.add_handler(CallbackQueryHandler(handle_mode_switch, pattern="^(mode_|show_help_cb_|search_hint_)"))
+    app.add_handler(CallbackQueryHandler(handle_buy_bot_license, pattern="^buybot_"))
+    app.add_handler(CallbackQueryHandler(handle_vault_browser_callback, pattern="^(browsechat_|browsetit_|browse_)"))
+    app.add_handler(CallbackQueryHandler(handle_del_index_callback, pattern="^delmod_"))
+    app.add_handler(CallbackQueryHandler(handle_promotion_callback, pattern="^sendpromo_"))
+    app.add_handler(CallbackQueryHandler(payment_option_selected, pattern="^(pay_|payusr_)"))
+    app.add_handler(CallbackQueryHandler(handle_admin_approval, pattern="^(approve|reject)_"))
+    app.add_handler(CallbackQueryHandler(handle_bot_license_approval, pattern="^(approvelic|rejectlic)_"))
+    app.add_handler(CallbackQueryHandler(handle_security_kick_decision, pattern="^seckick_"))
+
+    # 14. Anti-spam Room Join & Member Update Handlers
+    app.add_handler(ChatMemberHandler(handle_bot_added_to_chat, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
+
+    # 15. Contact Sharing Handler (Phone number 1-tap capture)
+    app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, handle_contact_message))
+
+    # 16. Purchase & Receipt Notification Flow Handlers
+    app.add_handler(
+        MessageHandler(
+            (filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_client_screenshot_receipt,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_client_text_message,
+        )
+    )
+
+    # 17. Security, Moderation & Auto-Indexing Handlers
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & filters.ChatType.GROUPS,
+            security_threat_detector,
+        ),
+        group=0,
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+            group_moderation_guard,
+        ),
+        group=1,
+    )
+    app.add_handler(
+        MessageHandler(
+            (filters.ChatType.GROUPS | filters.ChatType.CHANNEL) & ~filters.COMMAND,
+            auto_index_posts,
+        ),
+        group=2,
+    )
+
+    # 18. Autonomous AI Brain Group Mention & Reply Handler
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+            group_ai_mention_handler,
+        ),
+        group=3,
+    )
+
+async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = True) -> Tuple[bool, str, dict]:
+    """
+    Spawns an autonomous cloned bot instance using the customer's BotFather token.
+    The customer fully controls their own bot (@username), while the Real Owner
+    retains master surveillance and audit oversight from the Main Bot.
+    """
+    token = token.strip()
+    if not token or ":" not in token:
+        return False, "Invalid BotFather token format (expected 123456789:ABC...).", {}
+
+    if token in CLONED_BOT_APPS:
+        existing_info = CLONED_BOT_INFO.get(token, {})
+        return True, "Bot instance already running and active.", existing_info
+
+    try:
+        clone_app = ApplicationBuilder().token(token).build()
+        register_all_handlers(clone_app, is_clone=True, clone_owner_id=owner_id)
+
+        await clone_app.initialize()
+        await clone_app.start()
+
+        me = await clone_app.bot.get_me()
+        bot_info = {
+            "token": token,
+            "bot_id": me.id,
+            "bot_username": me.username or "",
+            "bot_name": me.first_name or "",
+            "owner_id": owner_id,
+            "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "is_active": True,
+            "total_commands_handled": 0,
+            "total_payments_received": 0,
+            "last_seen": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "webhook_active": False,
+        }
+
+        # Auto-register Webhook on Render.com if external URL is configured
+        render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
+        if register_webhook and render_url:
+            clone_webhook_url = f"{render_url.rstrip('/')}/{token}"
+            try:
+                await clone_app.bot.set_webhook(
+                    url=clone_webhook_url,
+                    allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post", "callback_query", "my_chat_member"],
+                    drop_pending_updates=False,
+                )
+                bot_info["webhook_active"] = True
+                logger.info(f"✅ Cloned bot @{me.username} webhook registered to: {clone_webhook_url}")
+            except Exception as wh_err:
+                logger.error(f"Failed setting webhook for cloned bot {me.id}: {wh_err}")
+
+        CLONED_BOT_APPS[token] = clone_app
+        CLONED_BOT_INFO[token] = bot_info
+
+        # Persist in GLOBAL_CONFIG
+        cloned_registry = GLOBAL_CONFIG.setdefault("cloned_bots", {})
+        cloned_registry[str(owner_id)] = bot_info
+        save_config(GLOBAL_CONFIG)
+
+        # Notify Real Owner with Master Surveillance Notice
+        real_owner_id = get_primary_admin_id()
+        clone_alert = (
+            "🤖 **[MASTER SURVEILLANCE] NEW BOT CLONE SPAWNED!**\n\n"
+            f"👑 **Clone Owner ID:** `{owner_id}`\n"
+            f"🤖 **Bot Name:** `{me.first_name}`\n"
+            f"🔗 **Bot Username:** @{me.username}\n"
+            f"🆔 **Bot ID:** `{me.id}`\n"
+            f"🔑 **Token:** `{token[:10]}...{token[-5:]}`\n"
+            f"🌐 **Webhook:** `{'Active' if bot_info['webhook_active'] else 'Standby'}`\n"
+            f"📅 **Spawned At:** `{bot_info['created_at']}`\n\n"
+            f"💡 _Use `/spyclone {owner_id}` or `/allclones` to inspect what they are doing._"
+        )
+        try:
+            await safe_send_message(bot=bot_app.bot, chat_id=real_owner_id, text=clone_alert, parse_mode="Markdown")
+        except Exception:
+            pass
+
+        log_system_event("CLONE_BOT_SPAWNED", f"Spawned clone @{me.username} for owner {owner_id}", user_id=owner_id, status="SUCCESS")
+        return True, f"Successfully cloned @{me.username}!", bot_info
+
+    except Exception as e:
+        logger.error(f"Error spawning cloned bot: {e}")
+        log_system_event("CLONE_BOT_ERROR", f"Failed cloning for {owner_id}: {e}", user_id=owner_id, status="ERROR")
+        return False, f"Telegram API rejection: {e}", {}
+
+async def stop_cloned_bot(owner_id: int) -> Tuple[bool, str]:
+    cloned_registry = GLOBAL_CONFIG.get("cloned_bots", {})
+    cinfo = cloned_registry.get(str(owner_id))
+    if not cinfo:
+        return False, f"No cloned bot registered for owner ID `{owner_id}`."
+    token = cinfo.get("token")
+    if token in CLONED_BOT_APPS:
+        app_inst = CLONED_BOT_APPS[token]
+        try:
+            await app_inst.bot.delete_webhook(drop_pending_updates=True)
+            await app_inst.stop()
+            await app_inst.shutdown()
+        except Exception as e:
+            logger.warning(f"Note on shutting down clone: {e}")
+        del CLONED_BOT_APPS[token]
+    cinfo["is_active"] = False
+    cinfo["webhook_active"] = False
+    save_config(GLOBAL_CONFIG)
+    log_system_event("CLONE_BOT_STOPPED", f"Clone stopped for owner {owner_id}", user_id=owner_id, status="WARN")
+    return True, f"Cloned bot for owner `{owner_id}` has been stopped."
+
+async def start_cloned_bot(owner_id: int) -> Tuple[bool, str]:
+    cloned_registry = GLOBAL_CONFIG.get("cloned_bots", {})
+    cinfo = cloned_registry.get(str(owner_id))
+    if not cinfo:
+        return False, f"No cloned bot registered for owner ID `{owner_id}`."
+    token = cinfo.get("token")
+    render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
+    success, msg_str, _ = await spawn_cloned_bot(token, owner_id, register_webhook=bool(render_url))
+    return success, msg_str
+
+async def delete_cloned_bot(owner_id: int) -> Tuple[bool, str]:
+    await stop_cloned_bot(owner_id)
+    cloned_registry = GLOBAL_CONFIG.get("cloned_bots", {})
+    cloned_registry.pop(str(owner_id), None)
+    save_config(GLOBAL_CONFIG)
+    log_system_event("CLONE_BOT_DELETED", f"Clone deleted for owner {owner_id}", user_id=owner_id, status="WARN")
+    return True, f"Cloned bot for owner `{owner_id}` removed permanently."
+
+async def clone_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Commands: /clonebot <TOKEN> or /setclonetoken <TOKEN> or /newbot <TOKEN>
+    Paid users deploy their own clone bot instance just like @BotFather!
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    # Check commercial license
+    if not is_user_licensed(user.id):
+        price = GLOBAL_CONFIG.get("bot_license_pricing", DEFAULT_GLOBAL_CONFIG["bot_license_pricing"])
+        text = (
+            "🔒 **COMMERCIAL BOT LICENSE REQUIRED!**\n\n"
+            "Cloning your own dedicated bot instance is a paid feature.\n"
+            f"💰 **License Price:** `{price}`\n\n"
+            "Once activated, you can supply your token from @BotFather to launch "
+            "your custom branded bot with full store & vault features!\n\n"
+            "👉 _Type `/start` and click '🤖 Buy Bot License' to purchase._"
+        )
+        await msg.reply_text(text, parse_mode="Markdown")
+        return
+
+    if not context.args:
+        help_text = (
+            "🤖 **HOW TO CLONE YOUR OWN TELEGRAM BOT (@BotFather STYLE):**\n\n"
+            "1️⃣ Open [@BotFather](https://t.me/BotFather) on Telegram.\n"
+            "2️⃣ Send `/newbot` and follow the instructions to name your bot and choose a username.\n"
+            "3️⃣ BotFather will give you an **API Token** (e.g. `123456789:ABCdef...`).\n"
+            "4️⃣ Return here and type:\n"
+            "   `/clonebot <YOUR_BOT_TOKEN>`\n\n"
+            "✨ Your cloned bot will immediately come to life with all features, your store, "
+            "auto-indexing, and payment processing!"
+        )
+        await msg.reply_text(help_text, parse_mode="Markdown", disable_web_page_preview=True)
+        return
+
+    token = context.args[0].strip()
+    status_msg = await msg.reply_text("⏳ **Contacting Telegram & Initializing Your Cloned Bot...**", parse_mode="Markdown")
+
+    render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
+    success, reply_msg, bot_info = await spawn_cloned_bot(token, user.id, register_webhook=bool(render_url))
+
+    if not success:
+        await status_msg.edit_text(f"❌ **Cloning Failed:** {reply_msg}\n\n_Make sure the token from @BotFather is exact and not revoked._", parse_mode="Markdown")
+        return
+
+    b_uname = bot_info.get("bot_username", "bot")
+    b_name = bot_info.get("bot_name", "Digital Vault Clone")
+    webhook_status = "🟢 Active (Render Webhook)" if bot_info.get("webhook_active") else "🟡 Standby"
+
+    congrats_text = (
+        f"🎉 **CONGRATULATIONS! YOUR BOT HAS BEEN CLONED!** 🎉\n\n"
+        f"🤖 **Bot Name:** `{b_name}`\n"
+        f"🔗 **Username:** [@{b_uname}](https://t.me/{b_uname})\n"
+        f"🌐 **Server Engine:** {webhook_status}\n\n"
+        "────────────────────────────────────────\n"
+        "👑 **YOU FULLY CONTROL THIS BOT INSTANCE:**\n"
+        "• `/sethub` - Connect your paid member channel/group\n"
+        "• `/setadmin` - Connect your private admin review group\n"
+        "• `/setindex` - Auto-index your videos, ebooks, and documents\n"
+        "• `/setpayment` - Add your GCash, Maya & Bank accounts\n"
+        "• `/shopname` - Set your custom store branding\n"
+        "• `/setai` - Connect your own AI Brain\n\n"
+        f"👉 **[Click Here to Open Your New Bot @{b_uname}](https://t.me/{b_uname})**"
+    )
+    await status_msg.edit_text(congrats_text, parse_mode="Markdown", disable_web_page_preview=False)
+
+async def my_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Shows the tenant's active cloned bot status.
+    Usage: /mybot
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    cloned_registry = GLOBAL_CONFIG.get("cloned_bots", {})
+    cinfo = cloned_registry.get(str(user.id))
+    if not cinfo:
+        await msg.reply_text("ℹ️ You have not cloned a bot yet. Use `/clonebot <TOKEN>` to deploy one!", parse_mode="Markdown")
+        return
+
+    status_badge = "🟢 ONLINE & ACTIVE" if cinfo.get("is_active") else "🔴 STOPPED"
+    wh_badge = "✅ Live Webhook" if cinfo.get("webhook_active") else "Standby"
+    b_uname = cinfo.get("bot_username", "bot")
+
+    card = (
+        f"🤖 **MY CLONED BOT DASHBOARD**\n\n"
+        f"• **Bot Name:** `{cinfo.get('bot_name')}`\n"
+        f"• **Username:** [@{b_uname}](https://t.me/{b_uname})\n"
+        f"• **Status:** {status_badge}\n"
+        f"• **Webhook:** {wh_badge}\n"
+        f"• **Spawned At:** `{cinfo.get('created_at')}`\n"
+        f"• **Commands Handled:** `{cinfo.get('total_commands_handled', 0)}`\n\n"
+        f"👉 [Open @{b_uname} in Telegram](https://t.me/{b_uname})"
+    )
+    await msg.reply_text(card, parse_mode="Markdown")
+
+# ================= REAL OWNER CLONE SURVEILLANCE SUITE =================
+
+async def master_all_clones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Real Bot Owner command: Lists all cloned bots across the platform.
+    Usage: /allclones
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if not is_super_admin(user.id):
+        await msg.reply_text("⛔ Restricted to Real Bot Super Admin.")
+        return
+
+    cloned = GLOBAL_CONFIG.get("cloned_bots", {})
+    if not cloned:
+        await msg.reply_text("ℹ️ No cloned bots registered on the platform yet.")
+        return
+
+    lines = [
+        "🤖 **MASTER CLONED BOTS SURVEILLANCE DIRECTORY**\n",
+        f"📊 **Total Active Clones:** `{len(cloned)}`\n",
+    ]
+    for idx, (oid, cinfo) in enumerate(cloned.items(), start=1):
+        status = "🟢" if cinfo.get("is_active") else "🔴"
+        uname = f"@{cinfo.get('bot_username')}" if cinfo.get("bot_username") else "No username"
+        tok_preview = f"{cinfo.get('token', '')[:8]}..."
+        lines.append(
+            f"{idx}. {status} **{cinfo.get('bot_name')}** ({uname})\n"
+            f"   Owner: `{oid}` | Token: `{tok_preview}` | Created: `{cinfo.get('created_at', '')[:10]}`"
+        )
+    lines.append("\n💡 _Use `/spyclone <owner_id>` to inspect detailed settings and activity._")
+    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def master_spy_clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Real Bot Owner command: Deep spy surveillance into a specific clone bot.
+    Usage: /spyclone <owner_id|@username>
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if not is_super_admin(user.id):
+        await msg.reply_text("⛔ Restricted to Real Bot Super Admin.")
+        return
+
+    if not context.args:
+        await msg.reply_text("⚠️ **Usage:** `/spyclone <owner_id|@username>`", parse_mode="Markdown")
+        return
+
+    query_str = context.args[0].strip().lstrip("@")
+    cloned = GLOBAL_CONFIG.get("cloned_bots", {})
+    target_oid = None
+    target_info = None
+
+    for oid, cinfo in cloned.items():
+        if oid == query_str or (cinfo.get("bot_username", "").lower() == query_str.lower()):
+            target_oid = oid
+            target_info = cinfo
+            break
+
+    if not target_info:
+        await msg.reply_text(f"❌ No cloned bot found matching `{query_str}`.")
+        return
+
+    # Fetch tenant configuration and registered rooms
+    oid_int = int(target_oid)
+    tcfg = get_tenant_config(oid_int)
+    payments = tcfg.get("payments", {})
+    pay_methods = list(payments.keys())
+
+    # Fetch user details
+    u_details = db_get_user(oid_int)
+    contact_phone = u_details.get("phone_number") if u_details else "Not Captured"
+    contact_email = u_details.get("email") if u_details else "Not Captured"
+    full_name = u_details.get("full_name") if u_details else "Unknown"
+
+    report = (
+        f"🕵️ **MASTER CLONE SPY DOSSIER: @{target_info.get('bot_username')}**\n\n"
+        f"👑 **Clone Owner:** {full_name} (`{target_oid}`)\n"
+        f"📱 **Phone:** `{contact_phone}` | 📧 **Email:** `{contact_email}`\n\n"
+        f"🤖 **BOT SPECIFICATIONS:**\n"
+        f"• **Name:** `{target_info.get('bot_name')}`\n"
+        f"• **Bot ID:** `{target_info.get('bot_id')}`\n"
+        f"• **Token:** `{target_info.get('token')}`\n"
+        f"• **Status:** `{'ONLINE' if target_info.get('is_active') else 'OFFLINE'}`\n"
+        f"• **Webhook:** `{'Active' if target_info.get('webhook_active') else 'Standby'}`\n"
+        f"• **Spawn Date:** `{target_info.get('created_at')}`\n\n"
+        f"🏪 **CONNECTED ROOMS & STORE:**\n"
+        f"• **Shop Name:** `{tcfg.get('shop_name', 'Default')}`\n"
+        f"• **SetAdmin Group:** `{tcfg.get('admin_proof_group_id', 'Not set')}`\n"
+        f"• **SetHub Group:** `{tcfg.get('main_hub_id', 'Not set')}`\n"
+        f"• **Proof Archive:** `{tcfg.get('proof_archive_id', 'Not set')}`\n"
+        f"• **Index Vaults:** `{len(tcfg.get('index_vault_ids', []))} channels`\n"
+        f"• **Payment Methods:** `{', '.join(pay_methods) if pay_methods else 'None configured'}`\n\n"
+        f"💡 _Controls: `/stopclone {target_oid}`, `/startclone {target_oid}`, `/delclone {target_oid}`_"
+    )
+    await msg.reply_text(report, parse_mode="Markdown")
+
+async def master_stop_clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not is_super_admin(user.id):
+        await msg.reply_text("⛔ Restricted to Real Bot Super Admin.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await msg.reply_text("⚠️ **Usage:** `/stopclone <owner_id>`", parse_mode="Markdown")
+        return
+    oid = int(context.args[0])
+    success, res_msg = await stop_cloned_bot(oid)
+    await msg.reply_text(f"{'✅' if success else '❌'} {res_msg}", parse_mode="Markdown")
+
+async def master_start_clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not is_super_admin(user.id):
+        await msg.reply_text("⛔ Restricted to Real Bot Super Admin.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await msg.reply_text("⚠️ **Usage:** `/startclone <owner_id>`", parse_mode="Markdown")
+        return
+    oid = int(context.args[0])
+    success, res_msg = await start_cloned_bot(oid)
+    await msg.reply_text(f"{'✅' if success else '❌'} {res_msg}", parse_mode="Markdown")
+
+async def master_del_clone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not is_super_admin(user.id):
+        await msg.reply_text("⛔ Restricted to Real Bot Super Admin.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await msg.reply_text("⚠️ **Usage:** `/delclone <owner_id>`", parse_mode="Markdown")
+        return
+    oid = int(context.args[0])
+    success, res_msg = await delete_cloned_bot(oid)
+    await msg.reply_text(f"{'✅' if success else '❌'} {res_msg}", parse_mode="Markdown")
+
 # ================= APPLICATION SETUP & WEBHOOK LIFECYCLE =================
 
 ACTIVE_BOT_TOKEN = GLOBAL_CONFIG.get("bot_token", "9118312201:AAFvZ6-cRZZCZqtbSz9dXTChxKYIKkTt9e8")
 bot_app = ApplicationBuilder().token(ACTIVE_BOT_TOKEN).build()
-
-# 1. Customer Commands
-bot_app.add_handler(CommandHandler("start", start_command))
-bot_app.add_handler(CommandHandler("help", member_help_command))
-bot_app.add_handler(CommandHandler(["search", "find"], search_command))
-bot_app.add_handler(CommandHandler("vaultstats", vault_stats_command))
-bot_app.add_handler(CommandHandler(["ai", "ask"], ask_ai_command))
-
-# 2. Administration & Setup Commands
-bot_app.add_handler(CommandHandler(["setup", "setting", "settings"], setup_wizard_command))
-bot_app.add_handler(CommandHandler("admin", admin_panel))
-bot_app.add_handler(CommandHandler(["setadminid", "adminid"], set_admin_id_command))
-
-# 3. Reload, Logs & Multi-Room Sync Commands
-bot_app.add_handler(CommandHandler("reload", reload_command))
-bot_app.add_handler(CommandHandler(["showlog", "logs", "log"], show_log_command))
-bot_app.add_handler(CommandHandler("clearlogs", clear_logs_command))
-bot_app.add_handler(CommandHandler(["syncsettings", "syncall", "checkrooms"], sync_settings_command))
-
-# 4. Commercial Bot License Real Owner Commands
-bot_app.add_handler(CommandHandler("grantlicense", grant_license_command))
-bot_app.add_handler(CommandHandler("revokelicense", revoke_license_command))
-bot_app.add_handler(CommandHandler("setlicenseprice", set_license_price_command))
-
-# 5. AI Brain Configuration Commands
-bot_app.add_handler(CommandHandler("setai", set_ai_command))
-bot_app.add_handler(CommandHandler(["setaiprompt", "setaiinstructions", "setpersona"], set_ai_prompt_command))
-bot_app.add_handler(CommandHandler("setaimodel", set_ai_model_command))
-bot_app.add_handler(CommandHandler("aitoggle", ai_toggle_command))
-bot_app.add_handler(CommandHandler(["aistatus", "aicontrol"], ai_status_command))
-
-# 6. Real Owner Master Surveillance & Inspector Suite Commands
-bot_app.add_handler(CommandHandler("viewuser", master_view_user_command))
-bot_app.add_handler(CommandHandler(["viewtenant", "viewstore"], master_view_tenant_command))
-bot_app.add_handler(CommandHandler("allusers", master_all_users_command))
-bot_app.add_handler(CommandHandler("alltenants", master_all_tenants_command))
-bot_app.add_handler(CommandHandler("tenantfiles", master_tenant_files_command))
-bot_app.add_handler(CommandHandler(["masteraudit", "spyactivity"], master_audit_command))
-
-# 5. User ID & Store Configuration Commands
-bot_app.add_handler(CommandHandler("setowner", set_owner_command))
-bot_app.add_handler(CommandHandler("addcoowner", add_coowner_command))
-bot_app.add_handler(CommandHandler("delcoowner", del_coowner_command))
-bot_app.add_handler(CommandHandler("renameowner", rename_owner_command))
-bot_app.add_handler(CommandHandler(["shopname", "setshopname"], set_shop_name_command))
-
-# 6. Multi-Tenant Room Binding Commands (with remove support)
-bot_app.add_handler(CommandHandler(["setindex", "unsetindex", "delindexroom"], set_index_command))
-bot_app.add_handler(CommandHandler(["sethub", "unsethub", "delhub"], set_hub_command))
-bot_app.add_handler(CommandHandler(["setadmin", "unsetadmin", "deladmin"], set_admin_group_command))
-bot_app.add_handler(CommandHandler(["setproof", "unsetproof", "delproof"], set_proof_archive_command))
-
-# 7. File, Jump Link & Index Customization Commands
-bot_app.add_handler(CommandHandler("viewvault", view_vault_command))
-bot_app.add_handler(CommandHandler("openlink", open_link_command))
-bot_app.add_handler(CommandHandler("customindex", custom_index_panel))
-bot_app.add_handler(CommandHandler("setindexlabel", set_index_label_command))
-bot_app.add_handler(CommandHandler("groupmodule", group_module_command))
-bot_app.add_handler(CommandHandler("renameitem", rename_item_command))
-bot_app.add_handler(CommandHandler("delindex", del_index_command))
-
-# 8. Bot Profile Commands
-bot_app.add_handler(CommandHandler("setbotname", set_bot_name_command))
-bot_app.add_handler(CommandHandler("setbotusername", set_bot_username_command))
-
-# 9. Payments & Custom Messaging Commands
-bot_app.add_handler(CommandHandler("setpayment", set_payment_command))
-bot_app.add_handler(CommandHandler("addpayment", add_payment_command))
-bot_app.add_handler(CommandHandler("delpayment", del_payment_command))
-bot_app.add_handler(CommandHandler("setmsg", set_msg_command))
-bot_app.add_handler(CommandHandler("promote", promote_command))
-bot_app.add_handler(CommandHandler("config", view_config_command))
-bot_app.add_handler(CommandHandler("addbadword", add_bad_word_command))
-
-# 10. Interactive Callback Handlers
-bot_app.add_handler(CallbackQueryHandler(handle_setup_callbacks, pattern="^setup_"))
-bot_app.add_handler(CallbackQueryHandler(handle_bind_room_callback, pattern="^bindroom_"))
-bot_app.add_handler(CallbackQueryHandler(handle_mode_switch, pattern="^(mode_|show_help_cb_|search_hint_)"))
-bot_app.add_handler(CallbackQueryHandler(handle_buy_bot_license, pattern="^buybot_"))
-bot_app.add_handler(CallbackQueryHandler(handle_vault_browser_callback, pattern="^(browsechat_|browsetit_|browse_)"))
-bot_app.add_handler(CallbackQueryHandler(handle_del_index_callback, pattern="^delmod_"))
-bot_app.add_handler(CallbackQueryHandler(handle_promotion_callback, pattern="^sendpromo_"))
-bot_app.add_handler(CallbackQueryHandler(payment_option_selected, pattern="^(pay_|payusr_)"))
-bot_app.add_handler(CallbackQueryHandler(handle_admin_approval, pattern="^(approve|reject)_"))
-bot_app.add_handler(CallbackQueryHandler(handle_bot_license_approval, pattern="^(approvelic|rejectlic)_"))
-bot_app.add_handler(CallbackQueryHandler(handle_security_kick_decision, pattern="^seckick_"))
-
-# 11. Anti-spam Room Join & Member Update Handlers
-bot_app.add_handler(ChatMemberHandler(handle_bot_added_to_chat, ChatMemberHandler.MY_CHAT_MEMBER))
-bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
-
-# 12. Contact Sharing Handler (Phone number 1-tap capture)
-bot_app.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, handle_contact_message))
-
-# 13. Purchase & Receipt Notification Flow Handlers
-bot_app.add_handler(
-    MessageHandler(
-        (filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_client_screenshot_receipt,
-    )
-)
-bot_app.add_handler(
-    MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_client_text_message,
-    )
-)
-
-# 14. Security, Moderation & Auto-Indexing Handlers
-bot_app.add_handler(
-    MessageHandler(
-        (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND & filters.ChatType.GROUPS,
-        security_threat_detector,
-    ),
-    group=0,
-)
-bot_app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
-        group_moderation_guard,
-    ),
-    group=1,
-)
-bot_app.add_handler(
-    MessageHandler(
-        (filters.ChatType.GROUPS | filters.ChatType.CHANNEL) & ~filters.COMMAND,
-        auto_index_posts,
-    ),
-    group=2,
-)
-
-# 15. Autonomous AI Brain Group Mention & Reply Handler
-bot_app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
-        group_ai_mention_handler,
-    ),
-    group=3,
-)
+register_all_handlers(bot_app, is_clone=False)
 
 # Persistent Event Loop for Webhook / Polling
 loop = asyncio.new_event_loop()
@@ -5061,7 +5607,7 @@ asyncio.set_event_loop(loop)
 loop.run_until_complete(bot_app.initialize())
 loop.run_until_complete(bot_app.start())
 
-# Auto-register Webhook on Render.com
+# Auto-register Webhook on Render.com for Main Bot
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
 if RENDER_EXTERNAL_URL:
     webhook_target = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{ACTIVE_BOT_TOKEN}"
@@ -5079,13 +5625,38 @@ if RENDER_EXTERNAL_URL:
         logger.error(f"⚠️ Webhook registration notice: {wh_err}")
         log_system_event("WEBHOOK_WARN", f"Webhook registration notice: {wh_err}", status="WARN")
 
-# Webhook endpoint for Telegram updates
-@app.route(f"/{ACTIVE_BOT_TOKEN}", methods=["POST"])
-def webhook():
+# Restore and initialize persistent cloned bots on startup
+cloned_saved = GLOBAL_CONFIG.get("cloned_bots", {})
+for owner_str, cinfo in cloned_saved.items():
+    if cinfo.get("is_active", True) and cinfo.get("token"):
+        try:
+            loop.run_until_complete(
+                spawn_cloned_bot(
+                    token=cinfo["token"],
+                    owner_id=int(owner_str),
+                    register_webhook=bool(RENDER_EXTERNAL_URL),
+                )
+            )
+            logger.info(f"🔄 Restored active clone @{cinfo.get('bot_username')} for owner {owner_str}")
+        except Exception as rest_err:
+            logger.error(f"Failed restoring clone for owner {owner_str}: {rest_err}")
+
+# Webhook endpoint for Telegram updates (Main Bot + Clones)
+@app.route("/<path:bot_token>", methods=["POST"])
+def webhook(bot_token: str):
     json_data = request.get_json(force=True)
-    update = Update.de_json(data=json_data, bot=bot_app.bot)
-    loop.run_until_complete(bot_app.process_update(update))
-    return jsonify({"status": "ok"}), 200
+    if bot_token == ACTIVE_BOT_TOKEN:
+        update = Update.de_json(data=json_data, bot=bot_app.bot)
+        loop.run_until_complete(bot_app.process_update(update))
+        return jsonify({"status": "ok", "bot": "main"}), 200
+    elif bot_token in CLONED_BOT_APPS:
+        clone_app = CLONED_BOT_APPS[bot_token]
+        update = Update.de_json(data=json_data, bot=clone_app.bot)
+        loop.run_until_complete(clone_app.process_update(update))
+        return jsonify({"status": "ok", "bot": "clone"}), 200
+    else:
+        logger.warning(f"Webhook update received for unregistered bot token: {bot_token[:10]}...")
+        return jsonify({"error": "Unknown bot token"}), 404
 
 # Health check endpoint for Render and UptimeRobot (supports both GET and HEAD)
 @app.route("/", methods=["GET", "HEAD"])
