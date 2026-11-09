@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import re
+import secrets
 import sqlite3
 import urllib.request
 import urllib.error
@@ -32,6 +33,7 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError, RetryAfter
 from telegram.helpers import escape_markdown
+from telegram.request import HTTPXRequest
 
 # ================= CONFIGURATION & CONSTANTS =================
 
@@ -46,6 +48,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("DigitalVaultBot")
 
 # Primary Admin Telegram ID from environment
@@ -5188,6 +5192,22 @@ async def master_audit_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 CLONED_BOT_APPS: Dict[str, Application] = {}  # token -> Application
 CLONED_BOT_INFO: Dict[str, dict] = {}          # token -> metadata dict
+WEBHOOK_SECRETS: Dict[str, str] = {}
+
+
+def build_bot_application(token: str) -> Application:
+    request_client = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+    return (
+        ApplicationBuilder()
+        .token(token)
+        .request(request_client)
+        .build()
+    )
 
 def register_all_handlers(app: Application, is_clone: bool = False, clone_owner_id: int = 0):
     """
@@ -5360,7 +5380,7 @@ async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = T
         return True, "Bot instance already running and active.", existing_info
 
     try:
-        clone_app = ApplicationBuilder().token(token).build()
+        clone_app = build_bot_application(token)
         register_all_handlers(clone_app, is_clone=True, clone_owner_id=owner_id)
 
         await clone_app.initialize()
@@ -5384,16 +5404,20 @@ async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = T
         # Auto-register Webhook on Render.com if external URL is configured
         render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
         if register_webhook and render_url:
-            clone_webhook_url = f"{render_url.rstrip('/')}/{token}"
+            clone_webhook_url = f"{render_url.rstrip('/')}/telegram-webhook"
+            webhook_secret = secrets.token_urlsafe(32)
+            WEBHOOK_SECRETS[token] = webhook_secret
             try:
                 await clone_app.bot.set_webhook(
                     url=clone_webhook_url,
+                    secret_token=webhook_secret,
                     allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post", "callback_query", "my_chat_member"],
                     drop_pending_updates=False,
                 )
                 bot_info["webhook_active"] = True
                 logger.info(f"✅ Cloned bot @{me.username} webhook registered.")
             except Exception as wh_err:
+                WEBHOOK_SECRETS.pop(token, None)
                 logger.error(f"Failed setting webhook for cloned bot {me.id}: {wh_err}")
 
         CLONED_BOT_APPS[token] = clone_app
@@ -5412,7 +5436,6 @@ async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = T
             f"🤖 **Bot Name:** `{me.first_name}`\n"
             f"🔗 **Bot Username:** @{me.username}\n"
             f"🆔 **Bot ID:** `{me.id}`\n"
-            f"🔑 **Token:** `{token[:10]}...{token[-5:]}`\n"
             f"🌐 **Webhook:** `{'Active' if bot_info['webhook_active'] else 'Standby'}`\n"
             f"📅 **Spawned At:** `{bot_info['created_at']}`\n\n"
             f"💡 _Use `/spyclone {owner_id}` or `/allclones` to inspect what they are doing._"
@@ -5445,6 +5468,7 @@ async def stop_cloned_bot(owner_id: int) -> Tuple[bool, str]:
         except Exception as e:
             logger.warning(f"Note on shutting down clone: {e}")
         del CLONED_BOT_APPS[token]
+    WEBHOOK_SECRETS.pop(token, None)
     cinfo["is_active"] = False
     cinfo["webhook_active"] = False
     save_config(GLOBAL_CONFIG)
@@ -5597,10 +5621,9 @@ async def master_all_clones_command(update: Update, context: ContextTypes.DEFAUL
     for idx, (oid, cinfo) in enumerate(cloned.items(), start=1):
         status = "🟢" if cinfo.get("is_active") else "🔴"
         uname = f"@{cinfo.get('bot_username')}" if cinfo.get("bot_username") else "No username"
-        tok_preview = f"{cinfo.get('token', '')[:8]}..."
         lines.append(
             f"{idx}. {status} **{cinfo.get('bot_name')}** ({uname})\n"
-            f"   Owner: `{oid}` | Token: `{tok_preview}` | Created: `{cinfo.get('created_at', '')[:10]}`"
+            f"   Owner: `{oid}` | Created: `{cinfo.get('created_at', '')[:10]}`"
         )
     lines.append("\n💡 _Use `/spyclone <owner_id>` to inspect detailed settings and activity._")
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -5656,7 +5679,6 @@ async def master_spy_clone_command(update: Update, context: ContextTypes.DEFAULT
         f"🤖 **BOT SPECIFICATIONS:**\n"
         f"• **Name:** `{target_info.get('bot_name')}`\n"
         f"• **Bot ID:** `{target_info.get('bot_id')}`\n"
-        f"• **Token:** `{target_info.get('token')}`\n"
         f"• **Status:** `{'ONLINE' if target_info.get('is_active') else 'OFFLINE'}`\n"
         f"• **Webhook:** `{'Active' if target_info.get('webhook_active') else 'Standby'}`\n"
         f"• **Spawn Date:** `{target_info.get('created_at')}`\n\n"
@@ -5718,7 +5740,7 @@ if not ACTIVE_BOT_TOKEN:
         "Missing TELEGRAM_TOKEN. Set it to the current token from BotFather in the "
         "service environment, then redeploy. Bot tokens are not read from bot_config.json."
     )
-bot_app = ApplicationBuilder().token(ACTIVE_BOT_TOKEN).build()
+bot_app = build_bot_application(ACTIVE_BOT_TOKEN)
 register_all_handlers(bot_app, is_clone=False)
 
 # Persistent Event Loop for Webhook / Polling
@@ -5731,11 +5753,14 @@ loop.run_until_complete(bot_app.start())
 # Auto-register Webhook on Render.com for Main Bot
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
 if RENDER_EXTERNAL_URL:
-    webhook_target = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{ACTIVE_BOT_TOKEN}"
+    webhook_target = f"{RENDER_EXTERNAL_URL.rstrip('/')}/telegram-webhook"
+    MAIN_WEBHOOK_SECRET = secrets.token_urlsafe(32)
+    WEBHOOK_SECRETS[ACTIVE_BOT_TOKEN] = MAIN_WEBHOOK_SECRET
     try:
         loop.run_until_complete(
             bot_app.bot.set_webhook(
                 url=webhook_target,
+                secret_token=MAIN_WEBHOOK_SECRET,
                 allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post", "callback_query", "my_chat_member"],
                 drop_pending_updates=False,
             )
@@ -5743,8 +5768,11 @@ if RENDER_EXTERNAL_URL:
         logger.info("✅ Webhook successfully registered with Telegram.")
         log_system_event("WEBHOOK_INIT", "Webhook registered with Telegram", status="SUCCESS")
     except Exception as wh_err:
+        WEBHOOK_SECRETS.pop(ACTIVE_BOT_TOKEN, None)
         logger.error(f"⚠️ Webhook registration notice: {wh_err}")
         log_system_event("WEBHOOK_WARN", f"Webhook registration notice: {wh_err}", status="WARN")
+else:
+    logger.warning("RENDER_EXTERNAL_URL or APP_URL is not set; Telegram webhook was not registered.")
 
 # Restore and initialize persistent cloned bots on startup
 cloned_saved = GLOBAL_CONFIG.get("cloned_bots", {})
@@ -5763,21 +5791,33 @@ for owner_str, cinfo in cloned_saved.items():
             logger.error(f"Failed restoring clone for owner {owner_str}: {rest_err}")
 
 # Webhook endpoint for Telegram updates (Main Bot + Clones)
-@app.route("/<path:bot_token>", methods=["POST"])
-def webhook(bot_token: str):
+@app.route("/telegram-webhook", methods=["POST"])
+def webhook():
+    provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    matched_token = next(
+        (
+            token
+            for token, secret in WEBHOOK_SECRETS.items()
+            if secrets.compare_digest(provided_secret, secret)
+        ),
+        None,
+    )
+    if matched_token is None:
+        return jsonify({"error": "Unauthorized webhook"}), 403
+
     json_data = request.get_json(force=True)
-    if bot_token == ACTIVE_BOT_TOKEN:
+    if matched_token == ACTIVE_BOT_TOKEN:
         update = Update.de_json(data=json_data, bot=bot_app.bot)
         loop.run_until_complete(bot_app.process_update(update))
         return jsonify({"status": "ok", "bot": "main"}), 200
-    elif bot_token in CLONED_BOT_APPS:
-        clone_app = CLONED_BOT_APPS[bot_token]
+    elif matched_token in CLONED_BOT_APPS:
+        clone_app = CLONED_BOT_APPS[matched_token]
         update = Update.de_json(data=json_data, bot=clone_app.bot)
         loop.run_until_complete(clone_app.process_update(update))
         return jsonify({"status": "ok", "bot": "clone"}), 200
     else:
-        logger.warning(f"Webhook update received for unregistered bot token: {bot_token[:10]}...")
-        return jsonify({"error": "Unknown bot token"}), 404
+        logger.warning("Webhook update received for a bot without a running application.")
+        return jsonify({"error": "Bot unavailable"}), 503
 
 # Health check endpoint for Render and UptimeRobot (supports both GET and HEAD)
 @app.route("/", methods=["GET", "HEAD"])
