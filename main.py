@@ -31,6 +31,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TelegramError, RetryAfter
+from telegram.helpers import escape_markdown
 
 # ================= CONFIGURATION & CONSTANTS =================
 
@@ -868,6 +869,9 @@ async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     return True
             except Exception as e:
                 logger.debug(f"Chat member check note: {e}")
+
+        if chat.type == "private" and is_user_licensed(user_id):
+            return True
 
     owner_str = str(user_id)
     if owner_str in GLOBAL_CONFIG.get("tenants", {}):
@@ -3682,21 +3686,18 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tenant_cfg = get_tenant_config(user.id)
-    shop_name = tenant_cfg.get("shop_name", "Digital Vault Store")
+    shop_name = escape_markdown(str(tenant_cfg.get("shop_name", "Digital Vault Store")).upper()[:80])
+    license_status = "Active" if is_user_licensed(user.id) else "Not active"
 
     admin_help_text = (
-        f"🛠️ **ADMIN CONTROL DESK: {shop_name.upper()}**\n\n"
+        f"🛠️ **ADMIN CONTROL DESK: {shop_name}**\n\n"
         "🔒 **Settings Location Rule:** Configuration can ONLY be changed in DM or SetAdmin group!\n"
-        "👑 **Commercial License:** Active\n\n"
+        f"👑 **Commercial License:** {license_status}\n\n"
         "🔄 **Reload & Live Sync:**\n"
         "• `/reload` - Reloads config & database\n"
         "• `/reload sync` - Reloads and pings all connected rooms\n"
         "• `/syncsettings` - Tests and broadcasts live update verification to all rooms\n"
         "• `/showlog` | `/logs` - Show recent activity, updates, and errors\n\n"
-        "👑 **Real Owner Bot Licensing:**\n"
-        "• `/grantlicense <USER_ID>` - Grant commercial license\n"
-        "• `/revokelicense <USER_ID>` - Revoke license\n"
-        "• `/setlicenseprice <Price>` - Set license pricing\n\n"
         "⚙️ **Full Setup Wizard:**\n"
         "• `/setup` - Interactive Control Panel inside private DM\n\n"
         "👤 **User ID & Store Management:**\n"
@@ -3737,17 +3738,23 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 **Bot Cloning Engine (@BotFather Style):**\n"
         "• `/clonebot <TOKEN>` (or `/setclonetoken`) - Spawn dedicated bot clone with your token\n"
         "• `/mybot` - View your cloned bot status & webhook health\n\n"
-        "🕵️ **Master Owner Surveillance (Real Owner Only):**\n"
-        "• `/viewuser <user_id|@username>` - Inspect user contact, phone, email & rooms\n"
-        "• `/viewtenant <owner_id>` - Spy on another tenant's store, rooms & vaults\n"
-        "• `/allusers [limit]` - List all captured users with phone & email\n"
-        "• `/alltenants` - List all commercial store owners & managers\n"
-        "• `/tenantfiles <id>` - Inspect files uploaded by a tenant or room\n"
-        "• `/allclones` - List all cloned bots and activity metrics\n"
-        "• `/spyclone <owner_id|@username>` - Deep spy audit of clone settings & actions\n"
-        "• `/stopclone <owner_id>` | `/startclone <owner_id>` | `/delclone <owner_id>` - Manage clones\n"
-        "• `/masteraudit` - Master global audit & real-time surveillance dashboard"
     )
+    if is_super_admin(user.id):
+        admin_help_text += (
+            "👑 **Real Owner Bot Licensing:**\n"
+            "• `/grantlicense <USER_ID>` - Grant commercial license\n"
+            "• `/revokelicense <USER_ID>` - Revoke commercial license\n"
+            "• `/setlicenseprice <Price>` - Set license pricing\n\n"
+            "🕵️ **Master Owner Surveillance:**\n"
+            "• `/viewuser <user_id|@username>` - Inspect user contact and rooms\n"
+            "• `/viewtenant <owner_id>` - Inspect a tenant's store and rooms\n"
+            "• `/allusers [limit]` - List registered users\n"
+            "• `/alltenants` - List commercial store owners\n"
+            "• `/tenantfiles <id>` - Inspect tenant or room files\n"
+            "• `/allclones` | `/spyclone <owner_id|@username>` - Inspect clones\n"
+            "• `/stopclone <owner_id>` | `/startclone <owner_id>` | `/delclone <owner_id>`\n"
+            "• `/masteraudit` - View the global system audit\n"
+        )
     await msg.reply_text(admin_help_text, parse_mode="Markdown")
 
 # ================= VAULT CONTENT INSPECTOR & JUMP LINKS =================
