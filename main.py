@@ -21,6 +21,7 @@ from telegram import (
     ChatMemberUpdated,
 )
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -129,7 +130,7 @@ DEFAULT_TENANT_CONFIG: Dict[str, Any] = {
 }
 
 DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
-    "bot_token": os.getenv("TELEGRAM_TOKEN", "9118312201:AAFvZ6-cRZZCZqtbSz9dXTChxKYIKkTt9e8"),
+    "bot_token": os.getenv("TELEGRAM_TOKEN", ""),
     "primary_admin_id": PRIMARY_ADMIN_TELEGRAM_ID,
     "primary_store_owner_id": PRIMARY_ADMIN_TELEGRAM_ID,
     "super_admin_ids": SUPER_ADMIN_IDS,
@@ -260,6 +261,16 @@ def init_db():
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS store_access (
+            user_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, owner_id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -359,6 +370,40 @@ def db_set_user_licensed(user_id: int, licensed: bool = True):
     except Exception as e:
         logger.error(f"Error setting license for {user_id}: {e}")
 
+def db_set_store_access(user_id: int, owner_id: int, granted: bool = True):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        if granted:
+            cursor.execute(
+                "INSERT OR IGNORE INTO store_access (user_id, owner_id) VALUES (?, ?)",
+                (user_id, owner_id),
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM store_access WHERE user_id=? AND owner_id=?",
+                (user_id, owner_id),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error updating store access for user {user_id}: {e}")
+
+def db_has_store_access(user_id: int, owner_id: int) -> bool:
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM store_access WHERE user_id=? AND owner_id=?",
+            (user_id, owner_id),
+        )
+        granted = cursor.fetchone() is not None
+        conn.close()
+        return granted
+    except Exception as e:
+        logger.error(f"Error checking store access for user {user_id}: {e}")
+        return False
+
 def db_get_user_by_id_or_username(identifier: str) -> Optional[Dict[str, Any]]:
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -381,7 +426,7 @@ def db_get_all_users(limit: int = 30) -> List[Dict[str, Any]]:
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM registered_users ORDER BY id DESC LIMIT ?", (limit,))
+        cursor.execute("SELECT * FROM registered_users ORDER BY user_id DESC LIMIT ?", (limit,))
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -482,20 +527,26 @@ def db_delete_chat_files(chat_id: int) -> int:
         logger.error(f"Error deleting files for chat {chat_id}: {e}")
         return 0
 
-def db_search_files(query_term: str, limit: int = 15) -> List[Dict[str, Any]]:
+def db_search_files(
+    query_term: str,
+    limit: int = 15,
+    owner_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     try:
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         term = f"%{query_term.strip()}%"
+        owner_filter = "owner_id=? AND " if owner_id is not None else ""
+        params = ([owner_id] if owner_id is not None else []) + [term, term, term, term, limit]
         cursor.execute(
-            """
+            f"""
             SELECT * FROM indexed_files
-            WHERE file_name LIKE ? OR caption LIKE ? OR module_title LIKE ? OR category_name LIKE ?
+            WHERE {owner_filter}(file_name LIKE ? OR caption LIKE ? OR module_title LIKE ? OR category_name LIKE ?)
             ORDER BY id DESC
             LIMIT ?
             """,
-            (term, term, term, term, limit),
+            tuple(params),
         )
         rows = [dict(row) for row in cursor.fetchall()]
         conn.close()
@@ -504,13 +555,21 @@ def db_search_files(query_term: str, limit: int = 15) -> List[Dict[str, Any]]:
         logger.error(f"Database search error: {e}")
         return []
 
-def db_search_files_by_type(query_term: str = "", file_type: str = "", limit: int = 15) -> List[Dict[str, Any]]:
+def db_search_files_by_type(
+    query_term: str = "",
+    file_type: str = "",
+    limit: int = 15,
+    owner_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     try:
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         conditions = []
         params = []
+        if owner_id is not None:
+            conditions.append("owner_id = ?")
+            params.append(owner_id)
         if file_type:
             conditions.append("file_type = ?")
             params.append(file_type)
@@ -686,6 +745,16 @@ def is_user_licensed(user_id: int) -> bool:
     if u and u.get("is_licensed"):
         return True
     return False
+
+def has_store_access(user_id: int, owner_id: int) -> bool:
+    tenant_cfg = GLOBAL_CONFIG.get("tenants", {}).get(str(owner_id), {})
+    store_admin_ids = {
+        owner_id,
+        int(tenant_cfg.get("primary_owner_id") or 0),
+        int(tenant_cfg.get("admin_telegram_id") or 0),
+        *(int(co_owner_id) for co_owner_id in tenant_cfg.get("co_owners", [])),
+    }
+    return is_super_admin(user_id) or user_id in store_admin_ids or db_has_store_access(user_id, owner_id)
 
 def get_tenant_config(owner_id: int) -> Dict[str, Any]:
     owner_str = str(owner_id)
@@ -2221,8 +2290,6 @@ async def handle_client_text_message(update: Update, context: ContextTypes.DEFAU
 
 async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-
     admin_user = query.from_user
     data = query.data.split("_")
     action = data[0]
@@ -2230,6 +2297,25 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
     owner_id = int(data[2]) if len(data) > 2 else get_primary_admin_id()
 
     tenant_cfg = get_tenant_config(owner_id)
+    authorized_admin_ids = {
+        int(owner_id),
+        int(tenant_cfg.get("primary_owner_id") or 0),
+        int(tenant_cfg.get("admin_telegram_id") or 0),
+        *(int(co_owner_id) for co_owner_id in tenant_cfg.get("co_owners", [])),
+    }
+    authorized = is_super_admin(admin_user.id) or admin_user.id in authorized_admin_ids
+    chat = query.message.chat if query.message else None
+    if not authorized and chat and chat.type in ["group", "supergroup"]:
+        try:
+            member = await context.bot.get_chat_member(chat.id, admin_user.id)
+            authorized = member.status in ["administrator", "creator"]
+        except Exception:
+            authorized = False
+    if not authorized:
+        await query.answer("Only this store's admins can review payments.", show_alert=True)
+        return
+    await query.answer()
+
     main_hub_id = tenant_cfg.get("main_hub_id", 0)
     proof_archive_id = tenant_cfg.get("proof_archive_id", 0)
 
@@ -2279,6 +2365,7 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
             hub_title = hub_chat.title if hub_chat and hub_chat.title else tenant_cfg.get('shop_name', 'Digital Vault Hub')
             link_display = f"👉 **Access Hub Link:**\n{join_link}" if join_link else "👉 _Access has been granted! Check the group or channel._"
 
+            db_set_store_access(buyer_id, owner_id)
             await context.bot.send_message(
                 chat_id=buyer_id,
                 text=(
@@ -2738,7 +2825,10 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query_term = " ".join(context.args).strip()
-    results = db_search_files(query_term, limit=10)
+    user = update.effective_user
+    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    results = db_search_files(query_term, limit=10, owner_id=owner_id)
+    can_open_files = bool(user and has_store_access(user.id, owner_id))
 
     if not results:
         await msg.reply_text(f"🔍 No files found matching: `{query_term}`.\nTry searching with a broader keyword.", parse_mode="Markdown")
@@ -2753,9 +2843,16 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_title = title.split("\n")[0][:45]
         cat = item.get("category_name", "Vault")
         link = item.get("direct_link", "#")
-        reply_text += f"{icon} **[{clean_title}]({link})**\n   📁 _{cat}_ • 📖 _{item.get('module_title', '')}_\n\n"
+        title_text = f"[{clean_title}]({link})" if can_open_files and link and link != "#" else f"**{clean_title}**"
+        reply_text += f"{icon} {title_text}\n   📁 _{cat}_ • 📖 _{item.get('module_title', '')}_\n"
+        if not can_open_files:
+            reply_text += "   🔒 _Payment approval is required to open this file._\n"
+        reply_text += "\n"
 
-    reply_text += "👉 _Click any link above to open directly in Telegram!_"
+    if can_open_files:
+        reply_text += "👉 _Click any link above to open directly in Telegram!_"
+    else:
+        reply_text += "🔒 _You can search the catalog; approved buyers can open the files._"
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text=reply_text, parse_mode="Markdown", disable_web_page_preview=True)
 
 async def courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2767,9 +2864,10 @@ async def courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     query_term = " ".join(context.args).strip() if context.args else ""
-    results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12)
-    if not results:
-        results = db_search_files(query_term or "course", limit=12)
+    user = update.effective_user
+    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12, owner_id=owner_id)
+    can_open_files = bool(user and has_store_access(user.id, owner_id))
 
     if not results:
         await msg.reply_text("🎓 No video courses found. Try `/search <topic>` or check back soon!", parse_mode="Markdown")
@@ -2782,8 +2880,11 @@ async def courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_title = title.split("\n")[0][:45]
         cat = item.get("category_name", "Course Vault")
         link = item.get("direct_link", "#")
-        lines.append(f"🎬 **[{clean_title}]({link})**\n   📁 _{cat}_\n")
-    lines.append("👉 _Click any course link above to open directly in Telegram!_")
+        title_text = f"[{clean_title}]({link})" if can_open_files and link and link != "#" else f"**{clean_title}**"
+        lines.append(f"🎬 {title_text}\n   📁 _{cat}_\n")
+        if not can_open_files:
+            lines.append("   🔒 _Payment approval is required to open this file._\n")
+    lines.append("👉 _Click any course link above to open directly in Telegram!_" if can_open_files else "🔒 _Approved buyers can open these files._")
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2795,7 +2896,10 @@ async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     query_term = " ".join(context.args).strip() if context.args else ""
-    results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12)
+    user = update.effective_user
+    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12, owner_id=owner_id)
+    can_open_files = bool(user and has_store_access(user.id, owner_id))
     if not results:
         await msg.reply_text("🎬 No videos found matching your query.", parse_mode="Markdown")
         return
@@ -2804,8 +2908,11 @@ async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = item.get("file_name") or item.get("caption") or "Video File"
         clean_title = title.split("\n")[0][:45]
         link = item.get("direct_link", "#")
-        lines.append(f"▶️ **[{clean_title}]({link})**\n   📁 _{item.get('category_name', 'Vault')}_\n")
-    lines.append("👉 _Click any link to stream/view in Telegram!_")
+        title_text = f"[{clean_title}]({link})" if can_open_files and link and link != "#" else f"**{clean_title}**"
+        lines.append(f"▶️ {title_text}\n   📁 _{item.get('category_name', 'Vault')}_\n")
+        if not can_open_files:
+            lines.append("   🔒 _Payment approval is required to open this file._\n")
+    lines.append("👉 _Click any link to stream/view in Telegram!_" if can_open_files else "🔒 _Approved buyers can open these files._")
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 async def ebooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2817,7 +2924,10 @@ async def ebooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     query_term = " ".join(context.args).strip() if context.args else ""
-    results = db_search_files_by_type(query_term=query_term, file_type="ebook", limit=12)
+    user = update.effective_user
+    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    results = db_search_files_by_type(query_term=query_term, file_type="ebook", limit=12, owner_id=owner_id)
+    can_open_files = bool(user and has_store_access(user.id, owner_id))
     if not results:
         await msg.reply_text("📚 No ebooks found matching your query.", parse_mode="Markdown")
         return
@@ -2826,8 +2936,11 @@ async def ebooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = item.get("file_name") or item.get("caption") or "E-Book Document"
         clean_title = title.split("\n")[0][:45]
         link = item.get("direct_link", "#")
-        lines.append(f"📖 **[{clean_title}]({link})**\n   📁 _{item.get('category_name', 'Library')}_\n")
-    lines.append("👉 _Click any link to read/download in Telegram!_")
+        title_text = f"[{clean_title}]({link})" if can_open_files and link and link != "#" else f"**{clean_title}**"
+        lines.append(f"📖 {title_text}\n   📁 _{item.get('category_name', 'Library')}_\n")
+        if not can_open_files:
+            lines.append("   🔒 _Payment approval is required to open this file._\n")
+    lines.append("👉 _Click any link to read/download in Telegram!_" if can_open_files else "🔒 _Approved buyers can open these files._")
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 async def vault_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5016,7 +5129,7 @@ async def master_audit_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"• 📧 **Users With Gmail Addresses:** `{counts['with_email']}`",
         f"• 👑 **Licensed Bot Tenants:** `{len(licensed)}`",
         f"• 🏪 **Active Multi-Tenant Stores:** `{len(tenants)}`",
-        f"• 📚 **Total Indexed Files in DB:** `{stats['total']}` ({stats['documents']} docs, {stats['videos']} videos)",
+        f"• 📚 **Total Indexed Files in DB:** `{stats['total']}` ({stats['ebooks']} documents, {stats['videos']} videos)",
         f"• ⚡ **Active Background Crawlers:** `{len(ACTIVE_INDEXING_TASKS)}`",
         f"• 📋 **In-Memory Logs Recorded:** `{len(SYSTEM_LOGS)}`\n",
         "🔍 **RECENT AUDIT & ACTIVITY EVENTS:**",
@@ -5556,7 +5669,9 @@ async def master_del_clone_command(update: Update, context: ContextTypes.DEFAULT
 
 # ================= APPLICATION SETUP & WEBHOOK LIFECYCLE =================
 
-ACTIVE_BOT_TOKEN = GLOBAL_CONFIG.get("bot_token", "9118312201:AAFvZ6-cRZZCZqtbSz9dXTChxKYIKkTt9e8")
+ACTIVE_BOT_TOKEN = (os.getenv("TELEGRAM_TOKEN") or GLOBAL_CONFIG.get("bot_token") or "").strip()
+if not ACTIVE_BOT_TOKEN:
+    raise RuntimeError("Set TELEGRAM_TOKEN in the Render environment or configure bot_token before starting the service.")
 bot_app = ApplicationBuilder().token(ACTIVE_BOT_TOKEN).build()
 register_all_handlers(bot_app, is_clone=False)
 
@@ -5579,8 +5694,8 @@ if RENDER_EXTERNAL_URL:
                 drop_pending_updates=False,
             )
         )
-        logger.info(f"✅ Webhook successfully registered with Telegram: {webhook_target}")
-        log_system_event("WEBHOOK_INIT", f"Webhook registered to {webhook_target}", status="SUCCESS")
+        logger.info("✅ Webhook successfully registered with Telegram.")
+        log_system_event("WEBHOOK_INIT", "Webhook registered with Telegram", status="SUCCESS")
     except Exception as wh_err:
         logger.error(f"⚠️ Webhook registration notice: {wh_err}")
         log_system_event("WEBHOOK_WARN", f"Webhook registration notice: {wh_err}", status="WARN")
@@ -5641,7 +5756,16 @@ def api_search():
     if not query_term:
         return jsonify({"error": "Missing query parameter 'q'"}), 400
     results = db_search_files(query_term, limit=25)
-    return jsonify({"query": query_term, "count": len(results), "results": results}), 200
+    public_results = [
+        {
+            "title": item.get("file_name") or item.get("module_title") or item.get("file_type") or "Indexed file",
+            "file_type": item.get("file_type"),
+            "category_name": item.get("category_name"),
+            "module_title": item.get("module_title"),
+        }
+        for item in results
+    ]
+    return jsonify({"query": query_term, "count": len(public_results), "results": public_results}), 200
 
 @app.route("/api/logs", methods=["GET"])
 def api_logs():
