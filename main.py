@@ -750,7 +750,16 @@ def get_primary_admin_id() -> int:
     return PRIMARY_ADMIN_TELEGRAM_ID
 
 def is_super_admin(user_id: int) -> bool:
-    return user_id in GLOBAL_CONFIG.get("super_admin_ids", SUPER_ADMIN_IDS) or user_id == get_primary_admin_id()
+    if user_id in SUPER_ADMIN_IDS or user_id == PRIMARY_ADMIN_TELEGRAM_ID or user_id == get_primary_admin_id():
+        return True
+
+    configured_ids = set()
+    for admin_id in GLOBAL_CONFIG.get("super_admin_ids", []):
+        try:
+            configured_ids.add(int(admin_id))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring an invalid value in configured super_admin_ids.")
+    return user_id in configured_ids
 
 def is_user_licensed(user_id: int) -> bool:
     """
@@ -3912,17 +3921,24 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• `/masteraudit` - View the global system audit\n"
         )
     if chat.type == "private":
-        await msg.reply_text(admin_help_text, parse_mode="Markdown")
-        return
-
-    try:
-        await context.bot.send_message(
-            chat_id=requester_id,
+        sent_message = await safe_send_message(
+            bot=context.bot,
+            chat_id=chat.id,
             text=admin_help_text,
             parse_mode="Markdown",
         )
-    except TelegramError as exc:
-        logger.warning("Could not send admin panel to user %s: %s", requester_id, exc)
+        if sent_message is None:
+            await msg.reply_text("I couldn't send the admin panel. Please try again in a moment.")
+        return
+
+    sent_message = await safe_send_message(
+        bot=context.bot,
+        chat_id=requester_id,
+        text=admin_help_text,
+        parse_mode="Markdown",
+    )
+    if sent_message is None:
+        logger.warning("Could not send admin panel to user %s.", requester_id)
         await msg.reply_text("Please start a private chat with this bot, then run `/admin` there.")
         return
     if user:
