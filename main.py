@@ -131,7 +131,6 @@ DEFAULT_TENANT_CONFIG: Dict[str, Any] = {
 }
 
 DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
-    "bot_token": os.getenv("TELEGRAM_TOKEN", ""),
     "primary_admin_id": PRIMARY_ADMIN_TELEGRAM_ID,
     "primary_store_owner_id": PRIMARY_ADMIN_TELEGRAM_ID,
     "super_admin_ids": SUPER_ADMIN_IDS,
@@ -683,7 +682,7 @@ def load_config() -> Dict[str, Any]:
                 data.setdefault("licensed_tenants", [PRIMARY_ADMIN_TELEGRAM_ID] + SUPER_ADMIN_IDS)
                 data.setdefault("bot_license_pricing", DEFAULT_GLOBAL_CONFIG["bot_license_pricing"])
                 data.setdefault("bot_license_payments", DEFAULT_GLOBAL_CONFIG["bot_license_payments"])
-                data.setdefault("bot_token", DEFAULT_GLOBAL_CONFIG["bot_token"])
+                data.pop("bot_token", None)
                 data.setdefault("settings", DEFAULT_GLOBAL_CONFIG["settings"])
                 data.setdefault("ai_engine", DEFAULT_GLOBAL_CONFIG["ai_engine"])
                 for k, v in DEFAULT_GLOBAL_CONFIG["ai_engine"].items():
@@ -5393,7 +5392,7 @@ async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = T
                     drop_pending_updates=False,
                 )
                 bot_info["webhook_active"] = True
-                logger.info(f"✅ Cloned bot @{me.username} webhook registered to: {clone_webhook_url}")
+                logger.info(f"✅ Cloned bot @{me.username} webhook registered.")
             except Exception as wh_err:
                 logger.error(f"Failed setting webhook for cloned bot {me.id}: {wh_err}")
 
@@ -5713,9 +5712,12 @@ async def master_del_clone_command(update: Update, context: ContextTypes.DEFAULT
 
 # ================= APPLICATION SETUP & WEBHOOK LIFECYCLE =================
 
-ACTIVE_BOT_TOKEN = (os.getenv("TELEGRAM_TOKEN") or GLOBAL_CONFIG.get("bot_token") or "").strip()
+ACTIVE_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 if not ACTIVE_BOT_TOKEN:
-    raise RuntimeError("Set TELEGRAM_TOKEN in the Render environment or configure bot_token before starting the service.")
+    raise RuntimeError(
+        "Missing TELEGRAM_TOKEN. Set it to the current token from BotFather in the "
+        "service environment, then redeploy. Bot tokens are not read from bot_config.json."
+    )
 bot_app = ApplicationBuilder().token(ACTIVE_BOT_TOKEN).build()
 register_all_handlers(bot_app, is_clone=False)
 

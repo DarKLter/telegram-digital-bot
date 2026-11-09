@@ -85,7 +85,6 @@ DEFAULT_TENANT_CONFIG = {
 }
 
 DEFAULT_GLOBAL_CONFIG = {
-    "bot_token": os.getenv("TELEGRAM_TOKEN", "9118312201:AAFvZ6-cRZZCZqtbSz9dXTChxKYIKkTt9e8"),
     "super_admin_ids": SUPER_ADMIN_IDS,
     "settings": {
         "allow_admin_member_cmds": False,
@@ -107,8 +106,7 @@ def load_config():
                     config["chat_tenant_map"] = {}
                 if "super_admin_ids" not in config:
                     config["super_admin_ids"] = SUPER_ADMIN_IDS
-                if "bot_token" not in config:
-                    config["bot_token"] = DEFAULT_GLOBAL_CONFIG["bot_token"]
+                config.pop("bot_token", None)
                 if "settings" not in config:
                     config["settings"] = DEFAULT_GLOBAL_CONFIG["settings"]
                 return config
@@ -2064,7 +2062,12 @@ async def view_config_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ================= APPLICATION BUILDER & WEBHOOK LIFECYCLE =================
 
-ACTIVE_BOT_TOKEN = GLOBAL_CONFIG.get("bot_token", "9118312201:AAFvZ6-cRZZCZqtbSz9dXTChxKYIKkTt9e8")
+ACTIVE_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+if not ACTIVE_BOT_TOKEN:
+    raise RuntimeError(
+        "Missing TELEGRAM_TOKEN. Set it to the current token from BotFather in the "
+        "service environment, then redeploy. Bot tokens are not read from bot_config.json."
+    )
 bot_app = ApplicationBuilder().token(ACTIVE_BOT_TOKEN).build()
 
 # Core Onboarding & DM Setup Commands
@@ -2143,7 +2146,7 @@ if RENDER_EXTERNAL_URL:
     webhook_target = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{ACTIVE_BOT_TOKEN}"
     try:
         loop.run_until_complete(bot_app.bot.set_webhook(url=webhook_target))
-        logger.info(f"✅ Webhook successfully registered with Telegram: {webhook_target}")
+        logger.info("✅ Webhook successfully registered with Telegram.")
     except Exception as wh_err:
         logger.error(f"⚠️ Webhook auto-registration warning: {wh_err}")
 
