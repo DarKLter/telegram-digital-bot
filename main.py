@@ -741,6 +741,12 @@ app = Flask(__name__)
 def normalize_title(title: str) -> str:
     return title.strip().lower()
 
+def normalize_chat_id(chat_id: Any) -> Optional[int]:
+    try:
+        return int(chat_id)
+    except (TypeError, ValueError):
+        return None
+
 def get_primary_admin_id() -> int:
     cfg_id = GLOBAL_CONFIG.get("primary_admin_id") or GLOBAL_CONFIG.get("primary_store_owner_id")
     if cfg_id and int(cfg_id) != 0:
@@ -808,15 +814,23 @@ def get_tenant_by_chat(chat_id: int) -> Tuple[Optional[int], Optional[Dict[str, 
     chat_str = str(chat_id)
     chat_map = GLOBAL_CONFIG.get("chat_tenant_map", {})
     if chat_str in chat_map:
-        owner_id = chat_map[chat_str]
+        owner_id = normalize_chat_id(chat_map[chat_str])
+        if owner_id is None:
+            logger.warning("Ignoring invalid tenant owner mapping for chat %s.", chat_id)
+            return None, None
         return owner_id, get_tenant_config(owner_id)
 
     for owner_key, tenant in GLOBAL_CONFIG.get("tenants", {}).items():
-        if chat_id in [
+        configured_chat_ids = [
             tenant.get("main_hub_id"),
             tenant.get("admin_proof_group_id"),
             tenant.get("proof_archive_id"),
-        ] or chat_id in tenant.get("index_vault_ids", []):
+            *tenant.get("index_vault_ids", []),
+        ]
+        if any(
+            normalize_chat_id(configured_id) == chat_id
+            for configured_id in configured_chat_ids
+        ):
             return int(owner_key), tenant
 
     primary_id = get_primary_admin_id()
@@ -1888,11 +1902,24 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_system_event("BIND_INDEX", f"Room {target_chat_id} registered as index vault", chat_id=target_chat_id, user_id=user.id, status="SUCCESS")
 
     target_chat_title = chat.title or f"Vault {target_chat_id}"
+    indexing_access_note = ""
     try:
         chat_info = await context.bot.get_chat(target_chat_id)
         target_chat_title = chat_info.title or target_chat_title
-    except Exception:
-        pass
+        bot_user = await context.bot.get_me()
+        bot_member = await context.bot.get_chat_member(target_chat_id, bot_user.id)
+        if bot_member.status not in ("administrator", "creator"):
+            indexing_access_note = (
+                "\n\n⚠️ **Bot access needs attention:** Make the bot an administrator in this "
+                "room so it can read new posts. In groups, alternatively disable Group Privacy "
+                "for the bot via @BotFather and re-add it."
+            )
+    except TelegramError as exc:
+        logger.warning("Could not verify bot indexing access in chat %s: %s", target_chat_id, exc)
+        indexing_access_note = (
+            "\n\n⚠️ **Bot access could not be verified.** Make the bot an administrator "
+            "in this room; in groups, also check Group Privacy in @BotFather."
+        )
 
     start_scan_id = 1
     depth = tenant_cfg.get("indexing_settings", {}).get("history_scan_depth", 2000)
@@ -1926,6 +1953,7 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• `/setindex remove` - Unbind room from indexing\n"
         f"• `/setindex status` - Check crawler progress\n"
         f"• `/setindex stop` - Halt active scan"
+        f"{indexing_access_note}"
     )
     progress_msg = await msg.reply_text(init_text, parse_mode="Markdown")
 
@@ -1960,8 +1988,14 @@ async def auto_index_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if owner_id is None or not tenant_cfg:
         return
 
-    index_vaults = tenant_cfg.get("index_vault_ids", [])
-    if chat_id not in index_vaults and chat_id != tenant_cfg.get("main_hub_id"):
+    index_vaults = {
+        normalized_id
+        for vault_id in tenant_cfg.get("index_vault_ids", [])
+        if (normalized_id := normalize_chat_id(vault_id)) is not None
+    }
+    main_hub_id = normalize_chat_id(tenant_cfg.get("main_hub_id"))
+    is_main_hub = main_hub_id is not None and main_hub_id == chat_id
+    if chat_id not in index_vaults and not is_main_hub:
         return
 
     chat_title = post_or_msg.chat.title or "Vault"
@@ -1978,18 +2012,35 @@ async def auto_index_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not result:
+        logger.debug("Auto-index skipped unsupported post %s in chat %s.", post_or_msg.message_id, chat_id)
         return
 
-    main_hub_id = tenant_cfg.get("main_hub_id")
+    log_system_event(
+        "AUTO_INDEX_POST",
+        f"Indexed {result.get('type')} from message {post_or_msg.message_id} in chat {chat_id}",
+        chat_id=chat_id,
+        user_id=owner_id,
+        status="SUCCESS",
+    )
     forward_to_hub = tenant_cfg.get("indexing_settings", {}).get("forward_to_hub", True)
-    if forward_to_hub:
-        await publish_index_result_to_hub(
+    if forward_to_hub and main_hub_id:
+        published = await publish_index_result_to_hub(
             bot=context.bot,
             hub_id=main_hub_id,
             source_chat_id=chat_id,
             source_chat_title=chat_title,
             result=result,
         )
+        if published:
+            log_system_event(
+                "AUTO_INDEX_PUBLISHED",
+                f"Published message {post_or_msg.message_id} from chat {chat_id} to hub {main_hub_id}",
+                chat_id=int(main_hub_id),
+                user_id=owner_id,
+                status="SUCCESS",
+            )
+    elif not forward_to_hub:
+        logger.info("Auto-index forwarding is disabled for tenant %s.", owner_id)
 
 # ================= PURCHASE & BOT LICENSE NOTIFICATIONS =================
 
