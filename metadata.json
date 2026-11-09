@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Digital Vault & AI Bot Engine",
+  "description": "Production multi-tenant Telegram digital vault, auto-indexing crawler, commercial licensing store, and AI brain engine with master owner surveillance suite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
