@@ -1434,6 +1434,48 @@ def extract_media_and_record(
         "file_num": file_num,
     }
 
+
+async def publish_index_result_to_hub(
+    bot,
+    hub_id: Optional[int],
+    source_chat_id: int,
+    source_chat_title: str,
+    result: Dict[str, Any],
+) -> bool:
+    if not hub_id or int(hub_id) == 0 or int(hub_id) == source_chat_id:
+        return False
+
+    if result.get("type") == "module_header":
+        text = (
+            f"📌 New module added to {source_chat_title}\n\n"
+            f"📖 Title: {result.get('title', 'Untitled module')}"
+        )
+    else:
+        text = (
+            f"📁 Category: {result.get('category_name', source_chat_title)}\n"
+            f"📖 Module: {result.get('module_title', 'General Library')}\n"
+            f"{result.get('icon', '📁')} #{result.get('file_num', '')}: "
+            f"{result.get('file_name', 'Indexed file')}\n\n"
+            f"🔗 Open in Telegram: {result.get('direct_link', '')}"
+        )
+
+    sent_message = await safe_send_message(
+        bot=bot,
+        chat_id=int(hub_id),
+        text=text,
+        parse_mode=None,
+    )
+    if sent_message is None:
+        log_system_event(
+            "INDEX_HUB_FORWARD_FAILED",
+            f"Could not publish indexed item from {source_chat_id} to hub {hub_id}",
+            chat_id=int(hub_id),
+            status="ERROR",
+        )
+        return False
+    return True
+
+
 # ================= BACKGROUND HISTORY AUTO-INDEXING SERVICE =================
 
 async def auto_indexer_history_crawler(
@@ -1445,6 +1487,8 @@ async def auto_indexer_history_crawler(
     owner_id: int,
     report_chat_id: int,
     progress_msg_id: int,
+    main_hub_id: Optional[int] = None,
+    forward_to_hub: bool = True,
 ):
     chat_info = await bot.get_chat(target_chat_id)
     chat_title = chat_info.title or f"Vault {target_chat_id}"
@@ -1452,6 +1496,8 @@ async def auto_indexer_history_crawler(
 
     total_scanned = 0
     total_indexed = 0
+    total_forwarded = 0
+    total_forward_failures = 0
     consecutive_misses = 0
     max_consecutive_misses = 60
 
@@ -1499,9 +1545,26 @@ async def auto_indexer_history_crawler(
                 source_message_id=msg_id,
             )
 
-            if result and result.get("type") not in ["module_header", None]:
-                total_indexed += 1
-                ACTIVE_INDEXING_TASKS[target_chat_id]["indexed"] = total_indexed
+            if result:
+                if result.get("type") != "module_header":
+                    total_indexed += 1
+                    ACTIVE_INDEXING_TASKS[target_chat_id]["indexed"] = total_indexed
+                if (
+                    forward_to_hub
+                    and main_hub_id
+                    and int(main_hub_id) != target_chat_id
+                ):
+                    published = await publish_index_result_to_hub(
+                        bot=bot,
+                        hub_id=main_hub_id,
+                        source_chat_id=target_chat_id,
+                        source_chat_title=chat_title,
+                        result=result,
+                    )
+                    if published:
+                        total_forwarded += 1
+                    else:
+                        total_forward_failures += 1
 
             try:
                 await forwarded.delete()
@@ -1555,11 +1618,18 @@ async def auto_indexer_history_crawler(
 
     ACTIVE_INDEXING_TASKS.pop(target_chat_id, None)
     stats = db_get_stats(target_chat_id)
+    forwarding_report = (
+        f"• ⚠️ **SetHub Publish Failures:** `{total_forward_failures}`\n"
+        if total_forward_failures
+        else ""
+    )
 
     completion_text = (
         f"✅ **AUTO-INDEXING COMPLETE: {chat_title.upper()}!**\n\n"
         f"• 📚 **Scanned Messages:** `{total_scanned}`\n"
         f"• 📂 **New Files Added:** `{total_indexed}`\n"
+        f"• 🔗 **Entries Published to SetHub:** `{total_forwarded}`\n"
+        f"{forwarding_report}"
         f"• 🗄️ **Total Files in DB for this Vault:** `{stats['total']}`\n"
         f"  - 🎬 Videos: `{stats['videos']}`\n"
         f"  - 📖 E-books/Docs: `{stats['ebooks']}`\n"
@@ -1862,6 +1932,8 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             owner_id=owner_id,
             report_chat_id=msg.chat.id,
             progress_msg_id=progress_msg.message_id,
+            main_hub_id=tenant_cfg.get("main_hub_id"),
+            forward_to_hub=tenant_cfg.get("indexing_settings", {}).get("forward_to_hub", True),
         )
     )
 
@@ -1901,29 +1973,14 @@ async def auto_index_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     main_hub_id = tenant_cfg.get("main_hub_id")
     forward_to_hub = tenant_cfg.get("indexing_settings", {}).get("forward_to_hub", True)
-
-    if main_hub_id and int(main_hub_id) != 0 and chat_id != int(main_hub_id) and forward_to_hub:
-        if result.get("type") == "module_header":
-            await safe_send_message(
-                bot=context.bot,
-                chat_id=int(main_hub_id),
-                text=f"📌 **NEW MODULE ADDED TO {chat_title.upper()}**\n\n📖 **Title:** `{result['title']}`\n────────────────────────────────────────",
-                parse_mode="Markdown",
-            )
-        else:
-            lesson_entry = (
-                f"📁 **Category:** {result.get('category_name')}\n"
-                f"📖 **Module:** {result.get('module_title')}\n"
-                f"{result.get('icon')} **#{result.get('file_num')}:** [{result.get('file_name')}]({result.get('direct_link')})\n\n"
-                f"👉 _Click link to view or download directly inside Telegram!_"
-            )
-            await safe_send_message(
-                bot=context.bot,
-                chat_id=int(main_hub_id),
-                text=lesson_entry,
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
+    if forward_to_hub:
+        await publish_index_result_to_hub(
+            bot=context.bot,
+            hub_id=main_hub_id,
+            source_chat_id=chat_id,
+            source_chat_title=chat_title,
+            result=result,
+        )
 
 # ================= PURCHASE & BOT LICENSE NOTIFICATIONS =================
 
@@ -3682,13 +3739,45 @@ async def handle_setup_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-    if not msg or not user:
+    chat = update.effective_chat
+    if not msg or not user or not chat:
         return
 
-    if not await check_settings_permission_or_reply(update, context, command_name="admin"):
+    tenant_owner_id = user.id
+    tenant_cfg = None
+    if is_super_admin(user.id):
+        tenant_cfg = get_tenant_config(user.id)
+    elif chat.type == "private":
+        tenant_candidates = [
+            (int(owner_id), config)
+            for owner_id, config in GLOBAL_CONFIG.get("tenants", {}).items()
+            if user.id in {
+                int(owner_id),
+                int(config.get("primary_owner_id") or owner_id),
+                int(config.get("admin_telegram_id") or 0),
+                *(int(co_owner_id) for co_owner_id in config.get("co_owners", [])),
+            }
+        ]
+        if tenant_candidates:
+            tenant_owner_id, tenant_cfg = tenant_candidates[0]
+        elif is_user_licensed(user.id):
+            tenant_cfg = get_tenant_config(user.id)
+    else:
+        tenant_owner_id, tenant_cfg = get_tenant_by_chat(chat.id)
+        if tenant_cfg:
+            allowed_admin_ids = {
+                tenant_owner_id,
+                int(tenant_cfg.get("primary_owner_id") or tenant_owner_id),
+                int(tenant_cfg.get("admin_telegram_id") or 0),
+                *(int(co_owner_id) for co_owner_id in tenant_cfg.get("co_owners", [])),
+            }
+            if user.id not in allowed_admin_ids:
+                tenant_cfg = None
+
+    if not tenant_cfg:
+        await msg.reply_text("⛔ Admin controls are available only to this store's owner or configured admins.")
         return
 
-    tenant_cfg = get_tenant_config(user.id)
     shop_name = escape_markdown(str(tenant_cfg.get("shop_name", "Digital Vault Store")).upper()[:80])
     license_status = "Active" if is_user_licensed(user.id) else "Not active"
 
@@ -3758,7 +3847,21 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• `/stopclone <owner_id>` | `/startclone <owner_id>` | `/delclone <owner_id>`\n"
             "• `/masteraudit` - View the global system audit\n"
         )
-    await msg.reply_text(admin_help_text, parse_mode="Markdown")
+    if chat.type == "private":
+        await msg.reply_text(admin_help_text, parse_mode="Markdown")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=admin_help_text,
+            parse_mode="Markdown",
+        )
+    except TelegramError as exc:
+        logger.warning("Could not send admin panel to user %s: %s", user.id, exc)
+        await msg.reply_text("Please start a private chat with this bot, then run `/admin` there.")
+        return
+    await msg.reply_text("✅ I sent the admin panel to your private chat.")
 
 # ================= VAULT CONTENT INSPECTOR & JUMP LINKS =================
 
