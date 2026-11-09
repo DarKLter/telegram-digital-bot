@@ -592,13 +592,15 @@ def db_get_stats(chat_id: Optional[int] = None) -> Dict[str, int]:
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        if chat_id:
+        if chat_id is not None:
             cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE chat_id=?", (chat_id,))
             total = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE chat_id=? AND file_type='video'", (chat_id,))
             videos = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE chat_id=? AND file_type='ebook'", (chat_id,))
+            cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE chat_id=? AND file_type IN ('ebook', 'document')", (chat_id,))
             ebooks = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE chat_id=? AND file_type='audio'", (chat_id,))
+            audio = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE chat_id=? AND file_type='app_software'", (chat_id,))
             software = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE chat_id=? AND file_type='code_archive'", (chat_id,))
@@ -608,23 +610,38 @@ def db_get_stats(chat_id: Optional[int] = None) -> Dict[str, int]:
             total = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE file_type='video'")
             videos = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE file_type='ebook'")
+            cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE file_type IN ('ebook', 'document')")
             ebooks = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE file_type='audio'")
+            audio = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE file_type='app_software'")
             software = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM indexed_files WHERE file_type='code_archive'")
             code = cursor.fetchone()[0]
         conn.close()
+        documents = ebooks
         return {
             "total": total,
             "videos": videos,
             "ebooks": ebooks,
+            "documents": documents,
+            "audio": audio,
+            "other": total - documents - videos - audio,
             "software": software,
             "code": code,
         }
     except Exception as e:
         logger.error(f"Database stats error: {e}")
-        return {"total": 0, "videos": 0, "ebooks": 0, "software": 0, "code": 0}
+        return {
+            "total": 0,
+            "videos": 0,
+            "ebooks": 0,
+            "documents": 0,
+            "audio": 0,
+            "other": 0,
+            "software": 0,
+            "code": 0,
+        }
 
 def db_update_scan_checkpoint(chat_id: int, last_scanned_id: int, highest_id: int, total_indexed: int):
     try:
@@ -1205,7 +1222,9 @@ def extract_media_and_record(
     owner_id: int,
     main_hub_id: int = 0,
     prefix_label: str = "Lesson",
+    source_message_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
+    source_message_id = source_message_id or post_or_msg.message_id
     has_media = bool(
         post_or_msg.video
         or post_or_msg.document
@@ -1257,12 +1276,21 @@ def extract_media_and_record(
             "items": [],
         }
 
-    VAULT_STATE[chat_id]["courses"][active_key]["file_count"] += 1
-    file_num = VAULT_STATE[chat_id]["courses"][active_key]["file_count"]
-    display_title = VAULT_STATE[chat_id]["courses"][active_key]["display_title"]
+    course = VAULT_STATE[chat_id]["courses"][active_key]
+    items = course.setdefault("items", [])
+    existing_item = next(
+        (item for item in items if item.get("msg_id") == source_message_id),
+        None,
+    )
+    if existing_item:
+        file_num = existing_item.get("num", course.get("file_count", 1))
+    else:
+        course["file_count"] = course.get("file_count", 0) + 1
+        file_num = course["file_count"]
+    display_title = course["display_title"]
 
     file_id = ""
-    file_unique_id = f"{chat_id}_{post_or_msg.message_id}"
+    file_unique_id = f"{chat_id}_{source_message_id}"
     file_name = ""
     mime_type = ""
     file_size = 0
@@ -1273,7 +1301,7 @@ def extract_media_and_record(
         default_label = f"{prefix_label} {file_num}"
         file_id = post_or_msg.video.file_id
         file_unique_id = post_or_msg.video.file_unique_id
-        file_name = post_or_msg.video.file_name or f"Video_{post_or_msg.message_id}.mp4"
+        file_name = post_or_msg.video.file_name or f"Video_{source_message_id}.mp4"
         mime_type = post_or_msg.video.mime_type or "video/mp4"
         file_size = post_or_msg.video.file_size or 0
 
@@ -1283,7 +1311,7 @@ def extract_media_and_record(
         default_label = f"Audio Track {file_num}"
         file_id = post_or_msg.audio.file_id
         file_unique_id = post_or_msg.audio.file_unique_id
-        file_name = post_or_msg.audio.file_name or f"Audio_{post_or_msg.message_id}.mp3"
+        file_name = post_or_msg.audio.file_name or f"Audio_{source_message_id}.mp3"
         mime_type = post_or_msg.audio.mime_type or "audio/mpeg"
         file_size = post_or_msg.audio.file_size or 0
 
@@ -1293,7 +1321,7 @@ def extract_media_and_record(
         default_label = f"Image {file_num}"
         file_id = post_or_msg.photo[-1].file_id
         file_unique_id = post_or_msg.photo[-1].file_unique_id
-        file_name = f"Photo_{post_or_msg.message_id}.jpg"
+        file_name = f"Photo_{source_message_id}.jpg"
         mime_type = "image/jpeg"
         file_size = post_or_msg.photo[-1].file_size or 0
 
@@ -1303,14 +1331,14 @@ def extract_media_and_record(
         default_label = f"Animation {file_num}"
         file_id = post_or_msg.animation.file_id
         file_unique_id = post_or_msg.animation.file_unique_id
-        file_name = post_or_msg.animation.file_name or f"Animation_{post_or_msg.message_id}.mp4"
+        file_name = post_or_msg.animation.file_name or f"Animation_{source_message_id}.mp4"
         mime_type = post_or_msg.animation.mime_type or "video/mp4"
         file_size = post_or_msg.animation.file_size or 0
 
     elif post_or_msg.document:
         file_id = post_or_msg.document.file_id
         file_unique_id = post_or_msg.document.file_unique_id
-        file_name = post_or_msg.document.file_name or f"Document_{post_or_msg.message_id}"
+        file_name = post_or_msg.document.file_name or f"Document_{source_message_id}"
         mime_type = post_or_msg.document.mime_type or "application/octet-stream"
         file_size = post_or_msg.document.file_size or 0
         doc_lower = file_name.lower()
@@ -1338,17 +1366,21 @@ def extract_media_and_record(
 
     caption_title = extracted_text.split("\n")[0] if extracted_text else (file_name or default_label)
 
+    # Telegram's file_unique_id identifies the media itself, not its indexed post.
+    # Include the source location so repeated uploads remain separate records.
+    file_unique_id = f"{file_unique_id}:{chat_id}:{source_message_id}"
+
     if chat_username:
         direct_link = (
-            f"https://t.me/{chat_username}/{thread_id}/{post_or_msg.message_id}"
+            f"https://t.me/{chat_username}/{thread_id}/{source_message_id}"
             if thread_id
-            else f"https://t.me/{chat_username}/{post_or_msg.message_id}"
+            else f"https://t.me/{chat_username}/{source_message_id}"
         )
     else:
         direct_link = (
-            f"https://t.me/c/{clean_chat_id}/{thread_id}/{post_or_msg.message_id}"
+            f"https://t.me/c/{clean_chat_id}/{thread_id}/{source_message_id}"
             if thread_id
-            else f"https://t.me/c/{clean_chat_id}/{post_or_msg.message_id}"
+            else f"https://t.me/c/{clean_chat_id}/{source_message_id}"
         )
 
     item_info = {
@@ -1357,9 +1389,12 @@ def extract_media_and_record(
         "num": file_num,
         "title": caption_title,
         "link": direct_link,
-        "msg_id": post_or_msg.message_id,
+        "msg_id": source_message_id,
     }
-    VAULT_STATE[chat_id]["courses"][active_key].setdefault("items", []).append(item_info)
+    if existing_item:
+        items[items.index(existing_item)] = item_info
+    else:
+        items.append(item_info)
     save_state(VAULT_STATE)
 
     db_record = {
@@ -1374,7 +1409,7 @@ def extract_media_and_record(
         "module_title": display_title,
         "chat_id": chat_id,
         "chat_title": chat_title or "Vault",
-        "message_id": post_or_msg.message_id,
+        "message_id": source_message_id,
         "thread_id": thread_id,
         "direct_link": direct_link,
         "owner_id": owner_id,
@@ -1454,6 +1489,7 @@ async def auto_indexer_history_crawler(
                 chat_title=chat_title,
                 chat_username=chat_username,
                 owner_id=owner_id,
+                source_message_id=msg_id,
             )
 
             if result and result.get("type") not in ["module_header", None]:
@@ -1682,8 +1718,10 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for a in context.args or []:
         if a.lstrip("-").isdigit():
-            target_chat_id = int(a)
-            break
+            candidate_chat_id = int(a)
+            if candidate_chat_id < 0:
+                target_chat_id = candidate_chat_id
+                break
 
     # 1. /setindex remove / clear / unset / del
     if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]):
@@ -1831,7 +1869,7 @@ async def auto_index_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = post_or_msg.chat.id
     owner_id, tenant_cfg = get_tenant_by_chat(chat_id)
-    if not tenant_cfg:
+    if owner_id is None or not tenant_cfg:
         return
 
     index_vaults = tenant_cfg.get("index_vault_ids", [])
@@ -2444,12 +2482,11 @@ async def handle_bot_license_approval(update: Update, context: ContextTypes.DEFA
     Activates full access and sends the buyer a comprehensive master tutorial.
     """
     query = update.callback_query
-    await query.answer()
-
     real_owner = query.from_user
     if not is_super_admin(real_owner.id):
         await query.answer("⛔ Access restricted to Real Bot Owner.", show_alert=True)
         return
+    await query.answer()
 
     data = query.data.split("_")
     action = data[0]
@@ -5769,8 +5806,14 @@ def api_search():
 
 @app.route("/api/logs", methods=["GET"])
 def api_logs():
-    limit = int(request.args.get("limit", 50))
-    return jsonify({"total_logs": len(SYSTEM_LOGS), "logs": SYSTEM_LOGS[-limit:]}), 200
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Query parameter 'limit' must be an integer"}), 400
+
+    limit = min(250, max(0, limit))
+    logs = SYSTEM_LOGS[-limit:] if limit else []
+    return jsonify({"total_logs": len(SYSTEM_LOGS), "logs": logs}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
