@@ -3740,12 +3740,37 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
-    if not msg or not user or not chat:
+    if not msg or not chat:
         return
 
-    tenant_owner_id = user.id
-    tenant_cfg = None
-    if is_super_admin(user.id):
+    tenant_owner_id: Optional[int] = None
+    tenant_cfg: Optional[Dict[str, Any]] = None
+
+    if not user and chat.type in ("channel", "group", "supergroup"):
+        mapped_owner = GLOBAL_CONFIG.get("chat_tenant_map", {}).get(str(chat.id))
+        if mapped_owner is not None:
+            tenant_owner_id = int(mapped_owner)
+            tenant_cfg = get_tenant_config(tenant_owner_id)
+        else:
+            for owner_key, config in GLOBAL_CONFIG.get("tenants", {}).items():
+                room_ids = [
+                    config.get("main_hub_id"),
+                    config.get("admin_proof_group_id"),
+                    config.get("proof_archive_id"),
+                    *config.get("index_vault_ids", []),
+                ]
+                if chat.id in [int(room_id) for room_id in room_ids if room_id]:
+                    tenant_owner_id = int(owner_key)
+                    tenant_cfg = get_tenant_config(tenant_owner_id)
+                    break
+        if not tenant_cfg:
+            await msg.reply_text("⛔ This channel is not connected to a store.")
+            return
+        user_id = int(tenant_cfg.get("primary_owner_id") or tenant_owner_id)
+    elif not user:
+        return
+    elif is_super_admin(user.id):
+        tenant_owner_id = user.id
         tenant_cfg = get_tenant_config(user.id)
     elif chat.type == "private":
         tenant_candidates = [
@@ -3761,9 +3786,39 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tenant_candidates:
             tenant_owner_id, tenant_cfg = tenant_candidates[0]
         elif is_user_licensed(user.id):
+            tenant_owner_id = user.id
             tenant_cfg = get_tenant_config(user.id)
     else:
-        tenant_owner_id, tenant_cfg = get_tenant_by_chat(chat.id)
+        mapped_owner = GLOBAL_CONFIG.get("chat_tenant_map", {}).get(str(chat.id))
+        if mapped_owner is not None:
+            tenant_owner_id = int(mapped_owner)
+            tenant_cfg = get_tenant_config(tenant_owner_id)
+        else:
+            for owner_key, config in GLOBAL_CONFIG.get("tenants", {}).items():
+                room_ids = [
+                    config.get("main_hub_id"),
+                    config.get("admin_proof_group_id"),
+                    config.get("proof_archive_id"),
+                    *config.get("index_vault_ids", []),
+                ]
+                if chat.id in [int(room_id) for room_id in room_ids if room_id]:
+                    tenant_owner_id = int(owner_key)
+                    tenant_cfg = get_tenant_config(tenant_owner_id)
+                    break
+
+            if tenant_cfg is None:
+                for owner_key, config in GLOBAL_CONFIG.get("tenants", {}).items():
+                    tenant_admin_ids = {
+                        int(owner_key),
+                        int(config.get("primary_owner_id") or owner_key),
+                        int(config.get("admin_telegram_id") or 0),
+                        *(int(co_owner_id) for co_owner_id in config.get("co_owners", [])),
+                    }
+                    if user.id in tenant_admin_ids:
+                        tenant_owner_id = int(owner_key)
+                        tenant_cfg = config
+                        break
+
         if tenant_cfg:
             allowed_admin_ids = {
                 tenant_owner_id,
@@ -3771,15 +3826,24 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(tenant_cfg.get("admin_telegram_id") or 0),
                 *(int(co_owner_id) for co_owner_id in tenant_cfg.get("co_owners", [])),
             }
-            if user.id not in allowed_admin_ids:
+            is_configured_admin = user.id in allowed_admin_ids
+            is_group_admin = False
+            if chat.type in ("group", "supergroup"):
+                try:
+                    member = await context.bot.get_chat_member(chat.id, user.id)
+                    is_group_admin = member.status in ("administrator", "creator")
+                except TelegramError as exc:
+                    logger.warning("Could not verify /admin requester in chat %s: %s", chat.id, exc)
+            if not (is_configured_admin or is_group_admin or is_super_admin(user.id)):
                 tenant_cfg = None
 
-    if not tenant_cfg:
+    if not tenant_cfg or tenant_owner_id is None:
         await msg.reply_text("⛔ Admin controls are available only to this store's owner or configured admins.")
         return
 
+    requester_id = user.id if user else user_id
     shop_name = escape_markdown(str(tenant_cfg.get("shop_name", "Digital Vault Store")).upper()[:80])
-    license_status = "Active" if is_user_licensed(user.id) else "Not active"
+    license_status = "Active" if is_user_licensed(requester_id) else "Not active"
 
     admin_help_text = (
         f"🛠️ **ADMIN CONTROL DESK: {shop_name}**\n\n"
@@ -3831,7 +3895,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/clonebot <TOKEN>` (or `/setclonetoken`) - Spawn dedicated bot clone with your token\n"
         "• `/mybot` - View your cloned bot status & webhook health\n\n"
     )
-    if is_super_admin(user.id):
+    if user and is_super_admin(user.id):
         admin_help_text += (
             "👑 **Real Owner Bot Licensing:**\n"
             "• `/grantlicense <USER_ID>` - Grant commercial license\n"
@@ -3853,15 +3917,18 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await context.bot.send_message(
-            chat_id=user.id,
+            chat_id=requester_id,
             text=admin_help_text,
             parse_mode="Markdown",
         )
     except TelegramError as exc:
-        logger.warning("Could not send admin panel to user %s: %s", user.id, exc)
+        logger.warning("Could not send admin panel to user %s: %s", requester_id, exc)
         await msg.reply_text("Please start a private chat with this bot, then run `/admin` there.")
         return
-    await msg.reply_text("✅ I sent the admin panel to your private chat.")
+    if user:
+        await msg.reply_text("✅ I sent the admin panel to your private chat.")
+    else:
+        await msg.reply_text("✅ I sent the admin panel to this store's configured owner.")
 
 # ================= VAULT CONTENT INSPECTOR & JUMP LINKS =================
 
