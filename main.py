@@ -954,6 +954,12 @@ def normalize_chat_id(chat_id: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
 
+def get_update_command_name(update: Update) -> str:
+    message = update.effective_message
+    text = (message.text or message.caption or "").strip() if message else ""
+    command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+    return command.lstrip("/").lower()
+
 def get_primary_admin_id() -> int:
     cfg_id = GLOBAL_CONFIG.get("primary_admin_id") or GLOBAL_CONFIG.get("primary_store_owner_id")
     if cfg_id and int(cfg_id) != 0:
@@ -998,6 +1004,16 @@ def has_store_access(user_id: int, owner_id: int) -> bool:
         *(int(co_owner_id) for co_owner_id in tenant_cfg.get("co_owners", [])),
     }
     return is_super_admin(user_id) or user_id in store_admin_ids or db_has_store_access(user_id, owner_id)
+
+def can_open_indexed_file_links(update: Update, owner_id: int) -> bool:
+    user = update.effective_user
+    chat = update.effective_chat
+    return bool(
+        user
+        and chat
+        and chat.type == "private"
+        and has_store_access(user.id, owner_id)
+    )
 
 def get_tenant_config(owner_id: int) -> Dict[str, Any]:
     owner_str = str(owner_id)
@@ -1095,8 +1111,6 @@ ADMIN_BOT_COMMANDS = [
     BotCommand("setting", "Open the setup wizard"),
     BotCommand("settings", "Open the setup wizard"),
     BotCommand("admin", "Open the admin panel"),
-    BotCommand("setadminid", "Set the administrator ID"),
-    BotCommand("adminid", "Set the administrator ID"),
     BotCommand("reload", "Reload settings"),
     BotCommand("showlog", "View system logs"),
     BotCommand("logs", "View system logs"),
@@ -1167,6 +1181,8 @@ ADMIN_BOT_COMMANDS = [
 ]
 
 DM_ONLY_BOT_COMMANDS = [
+    BotCommand("setadminid", "Set the administrator ID"),
+    BotCommand("adminid", "Set the administrator ID"),
     BotCommand("setadmin", "Set the Admin group or channel"),
     BotCommand("unsetadmin", "Remove the Admin group or channel"),
     BotCommand("deladmin", "Remove the Admin group or channel"),
@@ -2235,12 +2251,19 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tenant_cfg = get_tenant_config(owner_id)
     vault_list = tenant_cfg.setdefault("index_vault_ids", [])
     args = [a.lower() for a in context.args] if context.args else []
+    command_name = get_update_command_name(update)
+    remove_requested = command_name in {"unsetindex", "delindexroom"} or any(
+        kw in args for kw in ["remove", "clear", "unset", "del", "off"]
+    )
     requested_chat_ids = [
         int(arg) for arg in context.args
         if arg.lstrip("-").isdigit() and int(arg) < 0
     ] if context.args else []
     if chat.type == "private":
         if not requested_chat_ids:
+            if remove_requested:
+                await msg.reply_text("Usage: `/unsetindex <chat_id>`", parse_mode="Markdown")
+                return
             await msg.reply_text(
                 "In Bot DM, include the group/channel ID: `/setindex <chat_id> [start_id] [end_id]`.\n"
                 "To scan through the latest post automatically, run `/setindex` inside the target group/channel.",
@@ -2252,7 +2275,7 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_chat_id = requested_chat_ids[0] if requested_chat_ids else chat.id
 
     # 1. /setindex remove / clear / unset / del
-    if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]):
+    if remove_requested:
         if target_chat_id in ACTIVE_INDEXING_TASKS:
             ACTIVE_INDEXING_TASKS.pop(target_chat_id, None)
 
@@ -2956,7 +2979,7 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
     }
     authorized = is_super_admin(admin_user.id) or admin_user.id in authorized_admin_ids
     chat = query.message.chat if query.message else None
-    if not authorized and chat and chat.type in ["group", "supergroup"]:
+    if not authorized and chat and chat.type in ["group", "supergroup", "channel"]:
         try:
             member = await context.bot.get_chat_member(chat.id, admin_user.id)
             authorized = member.status in ["administrator", "creator"]
@@ -3486,10 +3509,10 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query_term = " ".join(context.args).strip()
-    user = update.effective_user
+    chat = update.effective_chat
     owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
     results = db_search_files(query_term, limit=10, owner_id=owner_id)
-    can_open_files = bool(user and has_store_access(user.id, owner_id))
+    can_open_files = can_open_indexed_file_links(update, owner_id)
 
     if not results:
         await msg.reply_text(f"🔍 No files found matching: `{query_term}`.\nTry searching with a broader keyword.", parse_mode="Markdown")
@@ -3507,11 +3530,18 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title_text = f"[{clean_title}]({link})" if can_open_files and link and link != "#" else f"**{clean_title}**"
         reply_text += f"{icon} {title_text}\n   📁 _{cat}_ • 📖 _{item.get('module_title', '')}_\n"
         if not can_open_files:
-            reply_text += "   🔒 _Payment approval is required to open this file._\n"
+            access_note = (
+                "Open file links in the bot's private chat."
+                if chat and chat.type != "private"
+                else "Payment approval is required to open this file."
+            )
+            reply_text += f"   🔒 _{access_note}_\n"
         reply_text += "\n"
 
     if can_open_files:
         reply_text += "👉 _Click any link above to open directly in Telegram!_"
+    elif chat and chat.type != "private":
+        reply_text += "🔒 _Open the catalog in the bot's private chat to access file links._"
     else:
         reply_text += "🔒 _You can search the catalog; approved buyers can open the files._"
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text=reply_text, parse_mode="Markdown", disable_web_page_preview=True)
@@ -3520,6 +3550,7 @@ def build_catalog_page(
     owner_id: int,
     user_id: Optional[int],
     offset: int = 0,
+    private_chat: bool = True,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     page_size = 10
     items, total = db_get_catalog_page(owner_id, limit=page_size, offset=offset)
@@ -3529,7 +3560,9 @@ def build_catalog_page(
             InlineKeyboardMarkup([]),
         )
 
-    can_open_files = bool(user_id and has_store_access(user_id, owner_id))
+    can_open_files = bool(
+        private_chat and user_id and has_store_access(user_id, owner_id)
+    )
     type_icons = {
         "video": "🎬",
         "ebook": "📚",
@@ -3559,7 +3592,9 @@ def build_catalog_page(
                 [InlineKeyboardButton(f"{icon} {title[:55]}", url=link)]
             )
 
-    if not can_open_files:
+    if not private_chat:
+        lines.append("\n🔒 Open this catalog in the bot's private chat to access file links.")
+    elif not can_open_files:
         lines.append("\n🔒 Open links are available after store access is approved.")
         keyboard_rows.append(
             [InlineKeyboardButton("🛒 Browse Store & Get Access", callback_data=f"mode_customer_{owner_id}")]
@@ -3595,6 +3630,7 @@ async def catalog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         owner_id,
         update.effective_user.id if update.effective_user else None,
         offset,
+        private_chat=bool(update.effective_chat and update.effective_chat.type == "private"),
     )
     await msg.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
 
@@ -3615,6 +3651,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         owner_id,
         query.from_user.id,
         offset,
+        private_chat=bool(query.message and query.message.chat.type == "private"),
     )
     if query.message:
         await context.bot.send_message(
@@ -3633,6 +3670,9 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if chat.type != "private":
         await msg.reply_text("For privacy, view user records in the bot's private chat.")
+        return
+    if not is_super_admin(user.id):
+        await msg.reply_text("For privacy, the global user report is available only to the bot owner.")
         return
     if not await check_settings_permission_or_reply(update, context, command_name="users"):
         return
@@ -3670,10 +3710,10 @@ async def courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     query_term = " ".join(context.args).strip() if context.args else ""
-    user = update.effective_user
+    chat = update.effective_chat
     owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
     results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12, owner_id=owner_id)
-    can_open_files = bool(user and has_store_access(user.id, owner_id))
+    can_open_files = can_open_indexed_file_links(update, owner_id)
 
     if not results:
         await msg.reply_text("🎓 No video courses found. Try `/search <topic>` or check back soon!", parse_mode="Markdown")
@@ -3689,8 +3729,14 @@ async def courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title_text = f"[{clean_title}]({link})" if can_open_files and link and link != "#" else f"**{clean_title}**"
         lines.append(f"🎬 {title_text}\n   📁 _{cat}_\n")
         if not can_open_files:
-            lines.append("   🔒 _Payment approval is required to open this file._\n")
-    lines.append("👉 _Click any course link above to open directly in Telegram!_" if can_open_files else "🔒 _Approved buyers can open these files._")
+            access_note = "Open file links in the bot's private chat." if chat and chat.type != "private" else "Payment approval is required to open this file."
+            lines.append(f"   🔒 _{access_note}_\n")
+    if can_open_files:
+        lines.append("👉 _Click any course link above to open directly in Telegram!_")
+    elif chat and chat.type != "private":
+        lines.append("🔒 _Open the catalog in the bot's private chat to access file links._")
+    else:
+        lines.append("🔒 _Approved buyers can open these files._")
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3702,10 +3748,10 @@ async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     query_term = " ".join(context.args).strip() if context.args else ""
-    user = update.effective_user
+    chat = update.effective_chat
     owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
     results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12, owner_id=owner_id)
-    can_open_files = bool(user and has_store_access(user.id, owner_id))
+    can_open_files = can_open_indexed_file_links(update, owner_id)
     if not results:
         await msg.reply_text("🎬 No videos found matching your query.", parse_mode="Markdown")
         return
@@ -3717,8 +3763,14 @@ async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title_text = f"[{clean_title}]({link})" if can_open_files and link and link != "#" else f"**{clean_title}**"
         lines.append(f"▶️ {title_text}\n   📁 _{item.get('category_name', 'Vault')}_\n")
         if not can_open_files:
-            lines.append("   🔒 _Payment approval is required to open this file._\n")
-    lines.append("👉 _Click any link to stream/view in Telegram!_" if can_open_files else "🔒 _Approved buyers can open these files._")
+            access_note = "Open file links in the bot's private chat." if chat and chat.type != "private" else "Payment approval is required to open this file."
+            lines.append(f"   🔒 _{access_note}_\n")
+    if can_open_files:
+        lines.append("👉 _Click any link to stream/view in Telegram!_")
+    elif chat and chat.type != "private":
+        lines.append("🔒 _Open the catalog in the bot's private chat to access file links._")
+    else:
+        lines.append("🔒 _Approved buyers can open these files._")
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 async def ebooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3730,10 +3782,10 @@ async def ebooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     query_term = " ".join(context.args).strip() if context.args else ""
-    user = update.effective_user
+    chat = update.effective_chat
     owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
     results = db_search_files_by_type(query_term=query_term, file_type="ebook", limit=12, owner_id=owner_id)
-    can_open_files = bool(user and has_store_access(user.id, owner_id))
+    can_open_files = can_open_indexed_file_links(update, owner_id)
     if not results:
         await msg.reply_text("📚 No ebooks found matching your query.", parse_mode="Markdown")
         return
@@ -3745,8 +3797,14 @@ async def ebooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title_text = f"[{clean_title}]({link})" if can_open_files and link and link != "#" else f"**{clean_title}**"
         lines.append(f"📖 {title_text}\n   📁 _{item.get('category_name', 'Library')}_\n")
         if not can_open_files:
-            lines.append("   🔒 _Payment approval is required to open this file._\n")
-    lines.append("👉 _Click any link to read/download in Telegram!_" if can_open_files else "🔒 _Approved buyers can open these files._")
+            access_note = "Open file links in the bot's private chat." if chat and chat.type != "private" else "Payment approval is required to open this file."
+            lines.append(f"   🔒 _{access_note}_\n")
+    if can_open_files:
+        lines.append("👉 _Click any link to read/download in Telegram!_")
+    elif chat and chat.type != "private":
+        lines.append("🔒 _Open the catalog in the bot's private chat to access file links._")
+    else:
+        lines.append("🔒 _Approved buyers can open these files._")
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 async def vault_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3771,10 +3829,12 @@ async def vault_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def set_admin_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-    if not msg or not user:
+    chat = update.effective_chat
+    if not msg or not user or not chat:
         return
 
-    if not await check_settings_permission_or_reply(update, context, command_name="setadminid"):
+    if chat.type != "private" or not is_super_admin(user.id):
+        await msg.reply_text("For security, only the bot owner can change the global Admin ID in private chat.")
         return
 
     if not context.args or not context.args[0].lstrip("-").isdigit():
@@ -3803,7 +3863,11 @@ async def set_hub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner_id = user.id if user else get_primary_admin_id()
     tenant_cfg = get_tenant_config(owner_id)
     args = [a.lower() for a in context.args] if context.args else []
-    if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]):
+    command_name = get_update_command_name(update)
+    remove_requested = command_name in {"unsethub", "delhub"} or any(
+        kw in args for kw in ["remove", "clear", "unset", "del", "off"]
+    )
+    if remove_requested:
         target_chat_id = normalize_chat_id(tenant_cfg.get("main_hub_id")) or 0
     elif chat.type == "private":
         if not context.args or not context.args[0].lstrip("-").isdigit():
@@ -3818,7 +3882,7 @@ async def set_hub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.args and context.args[0].lstrip("-").isdigit():
             target_chat_id = int(context.args[0])
 
-    if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]) or (tenant_cfg.get("main_hub_id") == target_chat_id and not args):
+    if remove_requested:
         old_hub_id = normalize_chat_id(tenant_cfg.get("main_hub_id"))
         tenant_cfg["main_hub_id"] = 0
         if old_hub_id is not None:
@@ -3856,7 +3920,11 @@ async def set_admin_group_command(update: Update, context: ContextTypes.DEFAULT_
     owner_id = user.id if user else get_primary_admin_id()
     tenant_cfg = get_tenant_config(owner_id)
     args = [a.lower() for a in context.args] if context.args else []
-    if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]):
+    command_name = get_update_command_name(update)
+    remove_requested = command_name in {"unsetadmin", "deladmin"} or any(
+        kw in args for kw in ["remove", "clear", "unset", "del", "off"]
+    )
+    if remove_requested:
         old_admin_id = normalize_chat_id(tenant_cfg.get("admin_proof_group_id"))
         tenant_cfg["admin_proof_group_id"] = 0
         if old_admin_id is not None:
@@ -3924,6 +3992,10 @@ async def set_proof_archive_command(update: Update, context: ContextTypes.DEFAUL
     tenant_cfg = get_tenant_config(owner_id)
     args = [a.lower() for a in context.args] if context.args else []
     action = args[0] if args else ""
+    command_name = get_update_command_name(update)
+    remove_requested = command_name in {"unsetproof", "delproof"} or action in {
+        "remove", "clear", "unset", "del", "off"
+    }
 
     if action == "list":
         if chat.type != "private":
@@ -3989,7 +4061,7 @@ async def set_proof_archive_command(update: Update, context: ContextTypes.DEFAUL
             )
         return
 
-    if action in ["remove", "clear", "unset", "del", "off"]:
+    if remove_requested:
         old_archive_id = normalize_chat_id(tenant_cfg.get("proof_archive_id"))
         tenant_cfg["proof_archive_id"] = 0
         if old_archive_id is not None:
