@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import threading
 import re
 import secrets
 import sqlite3
@@ -6997,6 +6998,35 @@ for owner_str, cinfo in cloned_saved.items():
         except Exception as rest_err:
             logger.error(f"Failed restoring clone for owner {owner_str}: {rest_err}")
 
+def _run_webhook_event_loop() -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+webhook_loop_thread = threading.Thread(
+    target=_run_webhook_event_loop,
+    name="telegram-webhook-loop",
+    daemon=True,
+)
+webhook_loop_thread.start()
+
+def _enqueue_webhook_update(application: Application, update: Update) -> bool:
+    enqueue_coro = application.update_queue.put(update)
+    try:
+        future = asyncio.run_coroutine_threadsafe(enqueue_coro, loop)
+    except RuntimeError:
+        enqueue_coro.close()
+        logger.exception("Could not enqueue Telegram webhook update.")
+        return False
+
+    def log_enqueue_failure(completed_future) -> None:
+        try:
+            completed_future.result()
+        except Exception:
+            logger.exception("Could not enqueue Telegram webhook update.")
+
+    future.add_done_callback(log_enqueue_failure)
+    return True
+
 # Webhook endpoint for Telegram updates (Main Bot + Clones)
 @app.route("/telegram-webhook", methods=["POST"])
 def webhook():
@@ -7015,12 +7045,14 @@ def webhook():
     json_data = request.get_json(force=True)
     if matched_token == ACTIVE_BOT_TOKEN:
         update = Update.de_json(data=json_data, bot=bot_app.bot)
-        loop.run_until_complete(bot_app.process_update(update))
+        if not _enqueue_webhook_update(bot_app, update):
+            return jsonify({"error": "Bot unavailable"}), 503
         return jsonify({"status": "ok", "bot": "main"}), 200
     elif matched_token in CLONED_BOT_APPS:
         clone_app = CLONED_BOT_APPS[matched_token]
         update = Update.de_json(data=json_data, bot=clone_app.bot)
-        loop.run_until_complete(clone_app.process_update(update))
+        if not _enqueue_webhook_update(clone_app, update):
+            return jsonify({"error": "Bot unavailable"}), 503
         return jsonify({"status": "ok", "bot": "clone"}), 200
     else:
         logger.warning("Webhook update received for a bot without a running application.")
