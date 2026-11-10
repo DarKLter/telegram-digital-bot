@@ -1076,7 +1076,11 @@ def get_admin_channel_owner(chat_id: int) -> Optional[int]:
 
 class ChannelCommandUpdate(Update):
     def __init__(self, update: Update, actor: User):
-        super().__init__(update.update_id, channel_post=update.channel_post)
+        super().__init__(
+            update.update_id,
+            channel_post=update.channel_post,
+            edited_channel_post=update.edited_channel_post,
+        )
         # Channel posts omit the human author; only trusted Admin channels get this tenant actor.
         self._channel_command_actor = actor
 
@@ -1191,6 +1195,26 @@ DM_ONLY_BOT_COMMANDS = [
 CHANNEL_ADMIN_COMMAND_NAMES = {
     command.command for command in ADMIN_BOT_COMMANDS
 }
+CHANNEL_PUBLIC_COMMAND_NAMES = {
+    "catalog",
+    "library",
+    "search",
+    "find",
+    "courses",
+    "course",
+    "videos",
+    "video",
+    "ebooks",
+    "ebook",
+    "pdfs",
+    "pdf",
+    "vaultstats",
+}
+CHANNEL_PUBLIC_BOT_COMMANDS = [
+    command
+    for command in PUBLIC_BOT_COMMANDS
+    if command.command in CHANNEL_PUBLIC_COMMAND_NAMES
+]
 
 
 async def register_admin_chat_command_menu(bot, chat_id: int) -> None:
@@ -1198,7 +1222,7 @@ async def register_admin_chat_command_menu(bot, chat_id: int) -> None:
         chat = await bot.get_chat(chat_id)
         if chat.type == "channel":
             await bot.set_my_commands(
-                ADMIN_BOT_COMMANDS,
+                CHANNEL_PUBLIC_BOT_COMMANDS + ADMIN_BOT_COMMANDS,
                 scope=BotCommandScopeChat(chat_id),
             )
     except TelegramError as exc:
@@ -1250,8 +1274,10 @@ def make_channel_admin_command(callback):
             await callback(update, context)
             return
 
-        text = message.text or ""
-        command = text.split(maxsplit=1)[0].split("@", 1)[0].lstrip("/").lower()
+        command = get_update_command_name(update)
+        if command in CHANNEL_PUBLIC_COMMAND_NAMES:
+            await callback(update, context)
+            return
         if command not in CHANNEL_ADMIN_COMMAND_NAMES:
             await message.reply_text("This command is only available in private chats or groups.")
             return
@@ -1402,11 +1428,10 @@ async def check_settings_permission_or_reply(
     command_name: str,
 ) -> bool:
     """
-    STRICT SETTINGS LOCATION ENFORCEMENT & COMMERCIAL LICENSE CHECK:
+    SETTINGS PERMISSION & COMMERCIAL LICENSE CHECK:
     1. User must be a Licensed Tenant or Bot Owner (deploying bot is not free).
-    2. Settings changes, edits, or updates of any group or channel are ONLY allowed:
-       - Inside Bot Private DM
-       - Inside the configured SetAdmin room (Admin Verification Group or Channel)
+    2. The user must be an administrator or owner. Channel commands are only
+       accepted from a configured Admin channel because channel posts omit authors.
     """
     msg = update.effective_message
     user = update.effective_user
@@ -1457,38 +1482,7 @@ async def check_settings_permission_or_reply(
         log_system_event("AUTH_DENIED", f"User {user_id} denied on /{command_name}", chat_id=chat.id, user_id=user_id, status="WARN")
         return False
 
-    tenant_cfg = get_tenant_config(user_id)
-    admin_group_id = tenant_cfg.get("admin_proof_group_id", 0)
-
-    # Rule A: Bot Private DM is ALWAYS allowed
-    if chat.type == "private":
-        return True
-
-    # Rule B: Inside the configured SetAdmin group or channel is ALWAYS allowed
-    if admin_group_id and int(chat.id) == int(admin_group_id):
-        return True
-
-    # Otherwise: Block settings changes in any other room!
-    bot_info = await context.bot.get_me()
-    admin_group_info = f"`{admin_group_id}`" if admin_group_id else "Not registered yet (run `/setadmin` in DM)"
-    warning_text = (
-        f"⛔ **SETTINGS EDIT RESTRICTED!**\n\n"
-        f"For security, group/channel settings can **ONLY be edited or updated inside:**\n"
-        f"1️⃣ **Bot Private DM** ([@{bot_info.username}](https://t.me/{bot_info.username}))\n"
-        f"2️⃣ Your registered **Admin Verification Group or Channel (`/setadmin`)**\n\n"
-        f"📍 **Current Room:** `{chat.title}` (`{chat.id}`)\n"
-        f"🛡️ **SetAdmin Room:** {admin_group_info}\n\n"
-        f"👉 _Please open private DM with @{bot_info.username} or run this inside your SetAdmin room._"
-    )
-    await msg.reply_text(warning_text, parse_mode="Markdown", disable_web_page_preview=True)
-    log_system_event(
-        "SETTINGS_LOCATION_BLOCKED",
-        f"Blocked /{command_name} in non-SetAdmin chat {chat.id} ({chat.title})",
-        chat_id=chat.id,
-        user_id=user_id,
-        status="SECURITY",
-    )
-    return False
+    return True
 
 # ================= MULTI-ROOM SETTINGS SYNC VERIFICATION =================
 
@@ -3259,7 +3253,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(
             "ℹ️ **ADMIN NOTICE**\n\n"
             "Member checkout (`/start`) is hidden for admins in group chats.\n"
-            "• Type `/setup` in private DM to open your **Full Setup Wizard**.\n"
+            "• Type `/setup` in a group or private DM to open your **Full Setup Wizard**.\n"
             "• Type `/admin` in private DM or a configured Admin room to open **Admin Control Panel**.",
             parse_mode="Markdown",
         )
@@ -3319,7 +3313,7 @@ async def member_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.reply_text(
             "ℹ️ **ADMIN NOTICE**\n\n"
             "Member help (`/help`) is hidden for Admins in group chats.\n"
-            "• Type `/setup` in private DM to open your **Full Setup Wizard**.\n"
+            "• Type `/setup` in a group or private DM to open your **Full Setup Wizard**.\n"
             "• Type `/admin` in private DM or a configured admin room to open **Admin Control Panel**.",
             parse_mode="Markdown",
         )
@@ -3514,7 +3508,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query_term = " ".join(context.args).strip()
     chat = update.effective_chat
-    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    owner_id = int((context.user_data or {}).get("active_owner_id") or get_primary_admin_id())
     results = db_search_files(query_term, limit=10, owner_id=owner_id)
     can_open_files = can_open_indexed_file_links(update, owner_id)
 
@@ -3628,7 +3622,7 @@ async def catalog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     page = max(1, int(context.args[0])) if context.args else 1
-    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    owner_id = int((context.user_data or {}).get("active_owner_id") or get_primary_admin_id())
     offset = (page - 1) * 10
     text, keyboard = build_catalog_page(
         owner_id,
@@ -3715,7 +3709,7 @@ async def courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     query_term = " ".join(context.args).strip() if context.args else ""
     chat = update.effective_chat
-    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    owner_id = int((context.user_data or {}).get("active_owner_id") or get_primary_admin_id())
     results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12, owner_id=owner_id)
     can_open_files = can_open_indexed_file_links(update, owner_id)
 
@@ -3753,7 +3747,7 @@ async def videos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     query_term = " ".join(context.args).strip() if context.args else ""
     chat = update.effective_chat
-    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    owner_id = int((context.user_data or {}).get("active_owner_id") or get_primary_admin_id())
     results = db_search_files_by_type(query_term=query_term, file_type="video", limit=12, owner_id=owner_id)
     can_open_files = can_open_indexed_file_links(update, owner_id)
     if not results:
@@ -3787,7 +3781,7 @@ async def ebooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     query_term = " ".join(context.args).strip() if context.args else ""
     chat = update.effective_chat
-    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    owner_id = int((context.user_data or {}).get("active_owner_id") or get_primary_admin_id())
     results = db_search_files_by_type(query_term=query_term, file_type="ebook", limit=12, owner_id=owner_id)
     can_open_files = can_open_indexed_file_links(update, owner_id)
     if not results:
@@ -4516,7 +4510,7 @@ async def setup_wizard_command(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
 
     setup_text = (
-        f"⚙️ **FULL DM SETUP WIZARD: {shop_name.upper()}**\n\n"
+        f"⚙️ **SETUP WIZARD: {shop_name.upper()}**\n\n"
         f"👑 **License Status:** `Active Commercial License`\n"
         f"👤 **Primary Owner ID:** `{tenant_cfg.get('primary_owner_id', user.id)}`\n"
         f"👥 **Co-Owners:** `{len(co_owners)} registered`\n\n"
@@ -4526,7 +4520,7 @@ async def setup_wizard_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"• 📍 **Proof Archive:** `{proof_id if proof_id else 'Not Set'}`\n"
         f"• 📚 **Index Content Vaults:** `{len(tenant_cfg.get('index_vault_ids', []))} rooms`\n\n"
         "────────────────────────────────────────\n"
-        "💡 _Select an item below to configure your store settings directly inside DM!_"
+        "💡 _Select an item below to configure your store settings._"
     )
     await msg.reply_text(setup_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -4701,7 +4695,7 @@ async def handle_setup_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             [InlineKeyboardButton("🔍 Open Vault Content Inspector", callback_data="browse_BACK")],
         ]
         setup_text = (
-            f"⚙️ **FULL DM SETUP WIZARD: {shop_name.upper()}**\n\n"
+            f"⚙️ **SETUP WIZARD: {shop_name.upper()}**\n\n"
             f"👑 **License Status:** `Active Commercial License`\n"
             f"👤 **Primary Owner ID:** `{tenant_cfg.get('primary_owner_id', user.id)}`\n"
             f"👥 **Co-Owners:** `{len(co_owners)} registered`\n\n"
@@ -4711,7 +4705,7 @@ async def handle_setup_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             f"• 📍 **Proof Archive:** `{proof_id if proof_id else 'Not Set'}`\n"
             f"• 📚 **Index Content Vaults:** `{len(tenant_cfg.get('index_vault_ids', []))} rooms`\n\n"
             "────────────────────────────────────────\n"
-            "💡 _Select an item below to configure your store settings directly inside DM!_"
+            "💡 _Select an item below to configure your store settings._"
         )
         await query.edit_message_text(setup_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -4826,7 +4820,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_help_text = (
         f"🛠️ **ADMIN CONTROL DESK: {shop_name}**\n\n"
-        "🔒 **Settings Location Rule:** Most configuration can be changed in Bot DM or the configured Admin room. `/setadmin` and its removal aliases are Bot-DM-only. Channel commands and replies are public; Telegram does not identify which channel administrator posted them.\n"
+        "🔒 **Settings Access:** Licensed owners/admins can use settings commands in Bot DM or groups. `/setadmin` and its removal aliases are Bot-DM-only. Channel admin commands require the configured Admin channel; channel posts and replies are public, and Telegram does not identify which channel administrator posted them.\n"
         f"👑 **Commercial License:** {license_status}\n\n"
         "🔄 **Reload & Live Sync:**\n"
         "• `/reload` - Reloads config & database\n"
@@ -4834,7 +4828,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/syncsettings` - Tests and broadcasts live update verification to all rooms\n"
         "• `/showlog` | `/logs` - Show recent activity, updates, and errors\n\n"
         "⚙️ **Full Setup Wizard:**\n"
-        "• `/setup` - Interactive Control Panel inside private DM\n\n"
+        "• `/setup` - Interactive Control Panel in Bot DM or a group\n\n"
         "👤 **User ID & Store Management:**\n"
         "• `/setowner <ID>` - Transfer primary store owner ID\n"
         "• `/addcoowner <ID>` | `/delcoowner <ID>` - Manage co-owners\n"
@@ -6569,6 +6563,11 @@ def register_all_handlers(app: Application, is_clone: bool = False, clone_owner_
     for handler_group in app.handlers.values():
         for handler in handler_group:
             if isinstance(handler, CommandHandler):
+                handler.filters = (
+                    (handler.filters or filters.UpdateType.MESSAGE)
+                    | filters.UpdateType.CHANNEL_POST
+                    | filters.UpdateType.EDITED_CHANNEL_POST
+                )
                 handler.callback = make_channel_admin_command(handler.callback)
 
 async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = True) -> Tuple[bool, str, dict]:
