@@ -6386,6 +6386,14 @@ async def master_audit_command(update: Update, context: ContextTypes.DEFAULT_TYP
 CLONED_BOT_APPS: Dict[str, Application] = {}  # token -> Application
 CLONED_BOT_INFO: Dict[str, dict] = {}          # token -> metadata dict
 WEBHOOK_SECRETS: Dict[str, str] = {}
+TELEGRAM_ALLOWED_UPDATES = [
+    "message",
+    "edited_message",
+    "channel_post",
+    "edited_channel_post",
+    "callback_query",
+    "my_chat_member",
+]
 
 
 def build_bot_application(token: str) -> Application:
@@ -6606,6 +6614,7 @@ async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = T
             "total_payments_received": 0,
             "last_seen": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
             "webhook_active": False,
+            "polling_active": False,
         }
 
         # Auto-register Webhook on Render.com if external URL is configured
@@ -6618,7 +6627,7 @@ async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = T
                 await clone_app.bot.set_webhook(
                     url=clone_webhook_url,
                     secret_token=webhook_secret,
-                    allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post", "callback_query", "my_chat_member"],
+                    allowed_updates=TELEGRAM_ALLOWED_UPDATES,
                     drop_pending_updates=False,
                 )
                 bot_info["webhook_active"] = True
@@ -6626,6 +6635,17 @@ async def spawn_cloned_bot(token: str, owner_id: int, register_webhook: bool = T
             except Exception as wh_err:
                 WEBHOOK_SECRETS.pop(token, None)
                 logger.error(f"Failed setting webhook for cloned bot {me.id}: {wh_err}")
+
+        if not bot_info["webhook_active"]:
+            if clone_app.updater is None:
+                raise RuntimeError("Telegram updater is unavailable; cannot start cloned bot polling.")
+            await clone_app.bot.delete_webhook(drop_pending_updates=False)
+            await clone_app.updater.start_polling(
+                allowed_updates=TELEGRAM_ALLOWED_UPDATES,
+                drop_pending_updates=False,
+            )
+            bot_info["polling_active"] = True
+            logger.info("Cloned bot @%s is receiving updates through polling.", me.username)
 
         CLONED_BOT_APPS[token] = clone_app
         CLONED_BOT_INFO[token] = bot_info
@@ -6669,7 +6689,10 @@ async def stop_cloned_bot(owner_id: int) -> Tuple[bool, str]:
     if token in CLONED_BOT_APPS:
         app_inst = CLONED_BOT_APPS[token]
         try:
-            await app_inst.bot.delete_webhook(drop_pending_updates=True)
+            if app_inst.updater and app_inst.updater.running:
+                await app_inst.updater.stop()
+            else:
+                await app_inst.bot.delete_webhook(drop_pending_updates=True)
             await app_inst.stop()
             await app_inst.shutdown()
         except Exception as e:
@@ -6678,6 +6701,7 @@ async def stop_cloned_bot(owner_id: int) -> Tuple[bool, str]:
     WEBHOOK_SECRETS.pop(token, None)
     cinfo["is_active"] = False
     cinfo["webhook_active"] = False
+    cinfo["polling_active"] = False
     save_config(GLOBAL_CONFIG)
     log_system_event("CLONE_BOT_STOPPED", f"Clone stopped for owner {owner_id}", user_id=owner_id, status="WARN")
     return True, f"Cloned bot for owner `{owner_id}` has been stopped."
@@ -6960,6 +6984,7 @@ loop.run_until_complete(bot_app.start())
 
 # Auto-register Webhook on Render.com for Main Bot
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
+MAIN_WEBHOOK_ACTIVE = False
 if RENDER_EXTERNAL_URL:
     webhook_target = f"{RENDER_EXTERNAL_URL.rstrip('/')}/telegram-webhook"
     MAIN_WEBHOOK_SECRET = secrets.token_urlsafe(32)
@@ -6969,10 +6994,11 @@ if RENDER_EXTERNAL_URL:
             bot_app.bot.set_webhook(
                 url=webhook_target,
                 secret_token=MAIN_WEBHOOK_SECRET,
-                allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post", "callback_query", "my_chat_member"],
+                allowed_updates=TELEGRAM_ALLOWED_UPDATES,
                 drop_pending_updates=False,
             )
         )
+        MAIN_WEBHOOK_ACTIVE = True
         logger.info("✅ Webhook successfully registered with Telegram.")
         log_system_event("WEBHOOK_INIT", "Webhook registered with Telegram", status="SUCCESS")
     except Exception as wh_err:
@@ -6981,6 +7007,24 @@ if RENDER_EXTERNAL_URL:
         log_system_event("WEBHOOK_WARN", f"Webhook registration notice: {wh_err}", status="WARN")
 else:
     logger.warning("RENDER_EXTERNAL_URL or APP_URL is not set; Telegram webhook was not registered.")
+
+if not MAIN_WEBHOOK_ACTIVE:
+    if bot_app.updater is None:
+        raise RuntimeError("Telegram updater is unavailable; cannot start bot polling.")
+    try:
+        loop.run_until_complete(bot_app.bot.delete_webhook(drop_pending_updates=False))
+        loop.run_until_complete(
+            bot_app.updater.start_polling(
+                allowed_updates=TELEGRAM_ALLOWED_UPDATES,
+                drop_pending_updates=False,
+            )
+        )
+        logger.info("Main bot is receiving updates through polling.")
+        log_system_event("POLLING_INIT", "Telegram polling started", status="SUCCESS")
+    except Exception as polling_err:
+        logger.exception("Could not start Telegram polling: %s", polling_err)
+        log_system_event("POLLING_ERROR", str(polling_err), status="ERROR")
+        raise
 
 # Restore and initialize persistent cloned bots on startup
 cloned_saved = GLOBAL_CONFIG.get("cloned_bots", {})
