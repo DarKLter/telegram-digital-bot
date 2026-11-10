@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import urllib.request
 import urllib.error
+from html import escape as escape_html
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Any, List, Set
 from flask import Flask, request, jsonify
@@ -102,7 +103,7 @@ DEFAULT_TENANT_CONFIG: Dict[str, Any] = {
             "Welcome **{name}** to **{shop_name}**!\n\n"
             "ℹ️ **ACCESS POLICY & RULES:**\n"
             "• **Members:** You are permitted to use `/start` (to checkout) and `/help` (for instructions).\n"
-            "• **Admins & Owners:** Store & hub controls (`/setup`, `/admin`, `/sethub`, `/setindex`, `/reload`, etc.) are locked to verified Administrators and can be run in Bot Private DM or your configured SetAdmin group/channel. In a channel, any admin who can publish posts can run commands because Telegram does not identify the individual poster; commands and replies are visible to channel subscribers. Do not enter passwords, API keys, or other secrets in channel commands. Add the bot as a channel administrator, then set it up with `/setadmin <channel_id>` in Bot Private DM.\n\n"
+            "• **Admins & Owners:** Store and hub controls are locked to verified Administrators and can generally be run in Bot Private DM or your configured SetAdmin group/channel. Configure or remove the Admin destination only with `/setadmin` in Bot Private DM. In a channel, any admin who can publish posts can run available commands because Telegram does not identify the individual poster; commands and replies are visible to channel subscribers. Do not enter passwords, API keys, or other secrets in channel commands. Add the bot as a channel administrator, then set it up with `/setadmin <channel_id>` in Bot Private DM.\n\n"
             "─── 🛒 **STEP-BY-STEP PURCHASING GUIDE** ───\n"
             "1️⃣ **Start Checkout:** Type `/start` in private DM.\n"
             "2️⃣ **Select Payment Method:** Choose GCash, Maya, Bank Transfer, or Crypto.\n"
@@ -281,6 +282,32 @@ def init_db():
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payment_proofs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            client_id INTEGER NOT NULL,
+            full_name TEXT,
+            username TEXT,
+            file_id TEXT,
+            file_type TEXT,
+            source_message_id INTEGER,
+            source_chat_id INTEGER,
+            archive_chat_id INTEGER,
+            archive_message_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_payment_proofs_owner
+        ON payment_proofs(owner_id, submitted_at)
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -431,18 +458,192 @@ def db_get_user_by_id_or_username(identifier: str) -> Optional[Dict[str, Any]]:
         logger.error(f"Error querying user {identifier}: {e}")
         return None
 
-def db_get_all_users(limit: int = 30) -> List[Dict[str, Any]]:
+def db_get_all_users(limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
     try:
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM registered_users ORDER BY user_id DESC LIMIT ?", (limit,))
+        cursor.execute(
+            "SELECT * FROM registered_users ORDER BY created_at DESC, user_id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"Error fetching all users: {e}")
         return []
+
+def db_get_catalog_page(
+    owner_id: int,
+    limit: int = 10,
+    offset: int = 0,
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM indexed_files WHERE owner_id=?",
+            (owner_id,),
+        )
+        total = int(cursor.fetchone()[0])
+        cursor.execute(
+            """
+            SELECT file_name, file_type, category_name, module_title, direct_link
+            FROM indexed_files
+            WHERE owner_id=?
+            ORDER BY category_name COLLATE NOCASE, module_title COLLATE NOCASE, id
+            LIMIT ? OFFSET ?
+            """,
+            (owner_id, limit, offset),
+        )
+        return [dict(row) for row in cursor.fetchall()], total
+    except sqlite3.Error:
+        logger.exception("Could not load catalog page for owner %s.", owner_id)
+        raise
+    finally:
+        conn.close()
+
+def db_record_payment_proof(
+    owner_id: int,
+    client_id: int,
+    full_name: str,
+    username: Optional[str],
+    file_id: Optional[str],
+    file_type: str,
+    source_message_id: int,
+    source_chat_id: int,
+) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO payment_proofs (
+                owner_id, client_id, full_name, username, file_id, file_type,
+                source_message_id, source_chat_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                owner_id,
+                client_id,
+                full_name,
+                username,
+                file_id,
+                file_type,
+                source_message_id,
+                source_chat_id,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    except sqlite3.Error:
+        logger.exception("Could not record payment proof for client %s.", client_id)
+        raise
+    finally:
+        conn.close()
+
+def db_get_payment_proofs(
+    owner_id: int,
+    limit: int = 10,
+    offset: int = 0,
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM payment_proofs WHERE owner_id=?",
+            (owner_id,),
+        )
+        total = int(cursor.fetchone()[0])
+        cursor.execute(
+            """
+            SELECT id, client_id, full_name, username, file_id, file_type,
+                   archive_chat_id, archive_message_id, status, submitted_at
+            FROM payment_proofs
+            WHERE owner_id=?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (owner_id, limit, offset),
+        )
+        return [dict(row) for row in cursor.fetchall()], total
+    except sqlite3.Error:
+        logger.exception("Could not load payment proofs for owner %s.", owner_id)
+        raise
+    finally:
+        conn.close()
+
+def db_get_payment_proof(owner_id: int, proof_id: int) -> Optional[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM payment_proofs WHERE owner_id=? AND id=?",
+            (owner_id, proof_id),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except sqlite3.Error:
+        logger.exception("Could not load payment proof %s for owner %s.", proof_id, owner_id)
+        raise
+    finally:
+        conn.close()
+
+def db_update_payment_proof_status(
+    owner_id: int,
+    proof_id: int,
+    status: str,
+) -> Optional[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE payment_proofs
+            SET status=?, updated_at=CURRENT_TIMESTAMP
+            WHERE owner_id=? AND id=?
+            """,
+            (status, owner_id, proof_id),
+        )
+        conn.commit()
+        cursor.execute(
+            "SELECT * FROM payment_proofs WHERE owner_id=? AND id=?",
+            (owner_id, proof_id),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except sqlite3.Error:
+        logger.exception("Could not update payment proof %s for owner %s.", proof_id, owner_id)
+        raise
+    finally:
+        conn.close()
+
+def db_set_payment_proof_archive_message(
+    proof_id: int,
+    archive_chat_id: int,
+    archive_message_id: int,
+) -> None:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        conn.execute(
+            """
+            UPDATE payment_proofs
+            SET archive_chat_id=?, archive_message_id=?
+            WHERE id=?
+            """,
+            (archive_chat_id, archive_message_id, proof_id),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        logger.exception("Could not link archived payment proof %s.", proof_id)
+        raise
+    finally:
+        conn.close()
 
 def db_count_users() -> Dict[str, int]:
     try:
@@ -872,6 +1073,8 @@ class ChannelCommandUpdate(Update):
 PUBLIC_BOT_COMMANDS = [
     BotCommand("start", "Open the store"),
     BotCommand("help", "Show usage instructions"),
+    BotCommand("catalog", "Browse indexed files"),
+    BotCommand("library", "Browse indexed files"),
     BotCommand("search", "Search files"),
     BotCommand("find", "Search files"),
     BotCommand("courses", "Browse courses"),
@@ -942,9 +1145,6 @@ ADMIN_BOT_COMMANDS = [
     BotCommand("sethub", "Set the main directory"),
     BotCommand("unsethub", "Remove the main directory"),
     BotCommand("delhub", "Remove the main directory"),
-    BotCommand("setadmin", "Set the Admin group or channel"),
-    BotCommand("unsetadmin", "Remove the Admin group or channel"),
-    BotCommand("deladmin", "Remove the Admin group or channel"),
     BotCommand("setproof", "Set the proof archive"),
     BotCommand("unsetproof", "Remove the proof archive"),
     BotCommand("delproof", "Remove the proof archive"),
@@ -964,6 +1164,13 @@ ADMIN_BOT_COMMANDS = [
     BotCommand("promote", "Promote an administrator"),
     BotCommand("config", "View configuration"),
     BotCommand("addbadword", "Add a moderation word"),
+]
+
+DM_ONLY_BOT_COMMANDS = [
+    BotCommand("setadmin", "Set the Admin group or channel"),
+    BotCommand("unsetadmin", "Remove the Admin group or channel"),
+    BotCommand("deladmin", "Remove the Admin group or channel"),
+    BotCommand("users", "View user records privately"),
 ]
 
 CHANNEL_ADMIN_COMMAND_NAMES = {
@@ -988,18 +1195,19 @@ async def register_admin_chat_command_menu(bot, chat_id: int) -> None:
 
 
 async def register_bot_command_menus(bot, owner_id: Optional[int] = None) -> None:
-    admin_commands = PUBLIC_BOT_COMMANDS + ADMIN_BOT_COMMANDS
+    group_admin_commands = PUBLIC_BOT_COMMANDS + ADMIN_BOT_COMMANDS
+    private_commands = group_admin_commands + DM_ONLY_BOT_COMMANDS
     try:
         await bot.set_my_commands(
             PUBLIC_BOT_COMMANDS,
             scope=BotCommandScopeAllGroupChats(),
         )
         await bot.set_my_commands(
-            ADMIN_BOT_COMMANDS,
+            group_admin_commands,
             scope=BotCommandScopeAllChatAdministrators(),
         )
         await bot.set_my_commands(
-            admin_commands,
+            private_commands,
             scope=BotCommandScopeAllPrivateChats(),
         )
     except TelegramError as exc:
@@ -1136,56 +1344,40 @@ async def notify_real_owner_new_user(
     user_id: int,
     full_name: str,
     username: Optional[str] = None,
-    phone_number: Optional[str] = None,
-    email: Optional[str] = None,
     event_tag: str = "NEW_USER_STARTED",
+    owner_id: Optional[int] = None,
 ):
     """
-    Sends real-time notification to the real owner of the bot when someone
-    or a new account starts chatting with the bot, capturing:
-    - Profile Full Name
-    - Telegram User ID & Username
-    - Phone Number
-    - Gmail / Email Address
-    - Timestamp & Direct Profile Link
+    Sends a basic-profile event to the configured admin destination.
+    Contact details are shown only in the private /users report.
     """
-    real_owner_id = get_primary_admin_id()
+    tenant_owner_id = owner_id or get_primary_admin_id()
     username_str = f"@{username}" if username else "No username"
-    phone_str = phone_number if phone_number else "⚠️ Pending Submission"
-    email_str = email if email else "⚠️ Pending Submission"
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     profile_link = f"tg://user?id={user_id}"
-    licensed_badge = "👑 LICENSED TENANT" if is_user_licensed(user_id) else "🔒 UNLICENSED (Store Member)"
 
     alert_text = (
-        f"🔔 **[REAL BOT OWNER ALERT: {event_tag}]**\n\n"
+        f"🔔 **[{event_tag}]**\n\n"
         f"👤 **Profile Name:** {full_name}\n"
         f"🆔 **Telegram User ID:** `{user_id}`\n"
         f"💬 **Username:** {username_str}\n"
-        f"📱 **Phone Number:** `{phone_str}`\n"
-        f"📧 **Gmail / Email:** `{email_str}`\n"
         f"📅 **Timestamp:** `{timestamp}`\n"
-        f"🛡️ **Bot Status:** {licensed_badge}\n\n"
         f"🔗 **Direct User Link:** [{full_name}]({profile_link})"
     )
     log_system_event(
         event_tag,
-        f"User {user_id} ({full_name}) | Phone: {phone_str} | Gmail: {email_str}",
+        f"User {user_id} ({full_name}) profile event",
         user_id=user_id,
         status="ALERT",
     )
 
-    # Route to Real Bot Owner and Super Admins
-    destinations = [real_owner_id]
-    for sa_id in SUPER_ADMIN_IDS:
-        if sa_id not in destinations:
-            destinations.append(sa_id)
-
-    for dest_id in destinations:
+    for dest_id in get_target_admin_destinations(tenant_owner_id, client_id=user_id):
         try:
-            await safe_send_message(bot, dest_id, alert_text, parse_mode="Markdown")
+            sent = await safe_send_message(bot, dest_id, alert_text, parse_mode="Markdown")
+            if sent is None:
+                logger.error("User profile notification was not delivered to admin chat %s.", dest_id)
         except Exception as e:
-            logger.error(f"Failed notifying real owner {dest_id}: {e}")
+            logger.error("Failed notifying admin chat %s about user %s: %s", dest_id, user_id, e)
 
 # ================= LOCATION SECURITY & EDIT PERMISSIONS =================
 
@@ -1193,7 +1385,6 @@ async def check_settings_permission_or_reply(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     command_name: str,
-    allow_initial_setadmin: bool = False,
 ) -> bool:
     """
     STRICT SETTINGS LOCATION ENFORCEMENT & COMMERCIAL LICENSE CHECK:
@@ -1260,10 +1451,6 @@ async def check_settings_permission_or_reply(
 
     # Rule B: Inside the configured SetAdmin group or channel is ALWAYS allowed
     if admin_group_id and int(chat.id) == int(admin_group_id):
-        return True
-
-    # Rule C: Allow /setadmin in any group so an admin can bind or update that group
-    if allow_initial_setadmin:
         return True
 
     # Otherwise: Block settings changes in any other room!
@@ -1459,6 +1646,26 @@ async def safe_send_photo(
         except Exception as err:
             logger.error(f"Critical failure sending photo to {chat_id}: {err}")
             return None
+
+async def safe_send_document(
+    bot,
+    chat_id: int,
+    document: str,
+    caption: str,
+    reply_markup: Optional[Any] = None,
+    parse_mode: Optional[str] = "Markdown",
+):
+    try:
+        return await bot.send_document(
+            chat_id=int(chat_id),
+            document=document,
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+    except Exception as e:
+        logger.error("Document send failed to %s: %s", chat_id, e)
+        return None
 
 # ================= EXTRACTOR FOR FILE & MEDIA METADATA =================
 
@@ -1739,8 +1946,6 @@ async def auto_indexer_history_crawler(
     total_indexed = 0
     total_forwarded = 0
     total_forward_failures = 0
-    consecutive_misses = 0
-    max_consecutive_misses = 60
 
     logger.info(
         f"Starting history crawl for {target_chat_id} from msg {start_msg_id} to {end_msg_id}..."
@@ -1774,8 +1979,6 @@ async def auto_indexer_history_crawler(
                 from_chat_id=target_chat_id,
                 message_id=msg_id,
             )
-
-            consecutive_misses = 0
 
             result = extract_media_and_record(
                 post_or_msg=forwarded,
@@ -1817,9 +2020,7 @@ async def auto_indexer_history_crawler(
             await asyncio.sleep(ra.retry_after + 1)
         except TelegramError as te:
             err_str = str(te).lower()
-            if "message to forward not found" in err_str or "message can't be forwarded" in err_str:
-                consecutive_misses += 1
-            else:
+            if "message to forward not found" not in err_str and "message can't be forwarded" not in err_str:
                 logger.debug(f"Scan note for msg {msg_id}: {te}")
 
         if total_scanned % 20 == 0:
@@ -1851,12 +2052,15 @@ async def auto_indexer_history_crawler(
             except Exception:
                 pass
 
-        if consecutive_misses > max_consecutive_misses and msg_id > (start_msg_id + 100):
-            logger.info(f"Reached {consecutive_misses} consecutive empty messages in {target_chat_id}. Ending scan.")
-            break
-
         await asyncio.sleep(0.05)
 
+    if total_scanned:
+        db_update_scan_checkpoint(
+            chat_id=target_chat_id,
+            last_scanned_id=msg_id,
+            highest_id=end_msg_id,
+            total_indexed=total_indexed,
+        )
     ACTIVE_INDEXING_TASKS.pop(target_chat_id, None)
     stats = db_get_stats(target_chat_id)
     forwarding_report = (
@@ -2030,16 +2234,22 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner_id = user.id if user else get_primary_admin_id()
     tenant_cfg = get_tenant_config(owner_id)
     vault_list = tenant_cfg.setdefault("index_vault_ids", [])
-    target_chat_id = chat.id
-
     args = [a.lower() for a in context.args] if context.args else []
-
-    for a in context.args or []:
-        if a.lstrip("-").isdigit():
-            candidate_chat_id = int(a)
-            if candidate_chat_id < 0:
-                target_chat_id = candidate_chat_id
-                break
+    requested_chat_ids = [
+        int(arg) for arg in context.args
+        if arg.lstrip("-").isdigit() and int(arg) < 0
+    ] if context.args else []
+    if chat.type == "private":
+        if not requested_chat_ids:
+            await msg.reply_text(
+                "In Bot DM, include the group/channel ID: `/setindex <chat_id> [start_id] [end_id]`.\n"
+                "To scan through the latest post automatically, run `/setindex` inside the target group/channel.",
+                parse_mode="Markdown",
+            )
+            return
+        target_chat_id = requested_chat_ids[0]
+    else:
+        target_chat_id = requested_chat_ids[0] if requested_chat_ids else chat.id
 
     # 1. /setindex remove / clear / unset / del
     if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]):
@@ -2141,7 +2351,7 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     start_scan_id = 1
     depth = tenant_cfg.get("indexing_settings", {}).get("history_scan_depth", 2000)
-    end_scan_id = msg.message_id if chat.id == target_chat_id else depth
+    end_scan_id = msg.message_id if chat.id == target_chat_id else 0
 
     num_args = [int(a) for a in context.args if a.isdigit()] if context.args else []
     if len(num_args) >= 2:
@@ -2153,21 +2363,37 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT last_scanned_id FROM scan_checkpoints WHERE chat_id=?", (target_chat_id,))
+    cursor.execute(
+        "SELECT last_scanned_id, highest_id FROM scan_checkpoints WHERE chat_id=?",
+        (target_chat_id,),
+    )
     row = cursor.fetchone()
     conn.close()
 
-    if row and row[0] and not num_args:
+    if row and row[0] and not num_args and chat.id != target_chat_id:
         start_scan_id = max(1, row[0])
+        end_scan_id = int(row[1] or row[0])
+    elif row and row[0] and not num_args:
+        start_scan_id = max(1, row[0])
+
+    should_scan_history = end_scan_id > 0
 
     init_text = (
         f"✅ **REAL-TIME SUCCESS!**\n\n"
         f"Room **{target_chat_title}** (`{target_chat_id}`) is now bound as an **INDEX CONTENT VAULT**!\n\n"
-        f"🚀 **AUTO-INDEXING LAUNCHED:**\n"
-        f"• Scanning history from message ID `{start_scan_id}` to `{end_scan_id}`\n"
-        f"• Auto-detecting and categorizing: E-Books, Videos, Apps, Archives, & Lessons\n"
-        f"• Rapid search database storage: Enabled\n\n"
-        f"💡 _Commands:_\n"
+        + (
+            f"🚀 **AUTO-INDEXING LAUNCHED:**\n"
+            f"• Scanning history from message ID `{start_scan_id}` to `{end_scan_id}`\n"
+            f"• Auto-detecting and categorizing: E-Books, Videos, Apps, Archives, & Lessons\n"
+            f"• Rapid search database storage: Enabled\n\n"
+            if should_scan_history
+            else
+            "✅ New posts will be indexed in real time. Telegram does not provide the bot with "
+            "the latest post ID when setup is performed from DM, so historical scanning was not started.\n"
+            "Run `/setindex <chat_id> <start_id> <end_id>` with known message IDs, or run `/setindex` "
+            "inside the target group/channel to scan its history through the current post.\n\n"
+        )
+        + f"💡 _Commands:_\n"
         f"• `/setindex remove` - Unbind room from indexing\n"
         f"• `/setindex status` - Check crawler progress\n"
         f"• `/setindex stop` - Halt active scan"
@@ -2177,20 +2403,21 @@ async def set_index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buffer_chat_id = tenant_cfg.get("admin_proof_group_id") or tenant_cfg.get("admin_telegram_id") or user.id
 
-    asyncio.create_task(
-        auto_indexer_history_crawler(
-            bot=context.bot,
-            target_chat_id=target_chat_id,
-            start_msg_id=start_scan_id,
-            end_msg_id=end_scan_id,
-            buffer_chat_id=buffer_chat_id,
-            owner_id=owner_id,
-            report_chat_id=msg.chat.id,
-            progress_msg_id=progress_msg.message_id,
-            main_hub_id=tenant_cfg.get("main_hub_id"),
-            forward_to_hub=tenant_cfg.get("indexing_settings", {}).get("forward_to_hub", True),
+    if should_scan_history:
+        asyncio.create_task(
+            auto_indexer_history_crawler(
+                bot=context.bot,
+                target_chat_id=target_chat_id,
+                start_msg_id=start_scan_id,
+                end_msg_id=end_scan_id,
+                buffer_chat_id=buffer_chat_id,
+                owner_id=owner_id,
+                report_chat_id=msg.chat.id,
+                progress_msg_id=progress_msg.message_id,
+                main_hub_id=tenant_cfg.get("main_hub_id"),
+                forward_to_hub=tenant_cfg.get("indexing_settings", {}).get("forward_to_hub", True),
+            )
         )
-    )
 
     await broadcast_settings_sync(context.bot, owner_id=owner_id, notify_rooms=True)
 
@@ -2268,6 +2495,8 @@ async def forward_purchase_notification_to_admin(
     owner_id: int,
     photo_file_id: Optional[str] = None,
     client_text_message: Optional[str] = None,
+    proof_id: Optional[int] = None,
+    attachment_is_document: bool = False,
 ) -> bool:
     client_id = client_user.id
     destinations = get_target_admin_destinations(owner_id, client_id=client_id)
@@ -2278,28 +2507,24 @@ async def forward_purchase_notification_to_admin(
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Approve Store Access", callback_data=f"approve_{client_id}_{owner_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{client_id}_{owner_id}"),
+            InlineKeyboardButton("✅ Approve Store Access", callback_data=f"approve_{client_id}_{owner_id}_{proof_id or 0}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{client_id}_{owner_id}_{proof_id or 0}"),
         ]
     ]
 
     timestamp_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     username_str = f"@{client_user.username}" if client_user.username else "No username"
 
-    u_data = db_get_user(client_id) or {}
-    phone_info = u_data.get("phone_number") or "Not provided"
-    email_info = u_data.get("email") or "Not provided"
-
     caption_text = (
         "📥 **NEW STORE ACCESS PURCHASE SUBMISSION**\n\n"
         f"👤 **Client Name:** {client_user.full_name}\n"
         f"🆔 **Client Telegram ID:** `{client_id}`\n"
         f"💬 **Username:** {username_str}\n"
-        f"📱 **Phone:** `{phone_info}`\n"
-        f"📧 **Gmail:** `{email_info}`\n"
         f"👑 **Store Owner ID:** `{owner_id}`\n"
         f"📅 **Submitted At:** `{timestamp_str}`\n"
     )
+    if proof_id is not None:
+        caption_text += f"🧾 **Proof Record:** `#{proof_id}`\n"
     if client_text_message:
         caption_text += f"\n📝 **Client Message / Ref #:**\n> {client_text_message}\n"
     caption_text += "\n👉 _Click Approve to issue single-use hub invite, or Reject to decline._"
@@ -2310,14 +2535,24 @@ async def forward_purchase_notification_to_admin(
             continue
         try:
             if photo_file_id:
-                res = await safe_send_photo(
-                    bot=bot,
-                    chat_id=target_chat_id,
-                    photo=photo_file_id,
-                    caption=caption_text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown",
-                )
+                if attachment_is_document:
+                    res = await safe_send_document(
+                        bot=bot,
+                        chat_id=target_chat_id,
+                        document=photo_file_id,
+                        caption=caption_text,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode="Markdown",
+                    )
+                else:
+                    res = await safe_send_photo(
+                        bot=bot,
+                        chat_id=target_chat_id,
+                        photo=photo_file_id,
+                        caption=caption_text,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode="Markdown",
+                    )
             else:
                 res = await safe_send_message(
                     bot=bot,
@@ -2334,41 +2569,6 @@ async def forward_purchase_notification_to_admin(
     if forwarded_anywhere:
         log_system_event("PURCHASE_SUBMITTED", f"Receipt from {client_id} forwarded to {destinations}", user_id=client_id, status="SUCCESS")
 
-    # Real Owner Master Surveillance Shadow Notification (exclusive to real bot owner)
-    primary_owner = get_primary_admin_id()
-    if int(owner_id) != int(primary_owner):
-        shadow_caption = (
-            "🕵️ **[MASTER SURVEILLANCE] TENANT PURCHASE SUBMISSION**\n\n"
-            f"👑 **Store Tenant ID:** `{owner_id}`\n"
-            f"👤 **Customer Name:** {client_user.full_name}\n"
-            f"🆔 **Customer ID:** `{client_id}`\n"
-            f"💬 **Username:** {username_str}\n"
-            f"📱 **Phone:** `{phone_info}`\n"
-            f"📧 **Gmail:** `{email_info}`\n"
-            f"📅 **Time:** `{timestamp_str}`\n"
-        )
-        if client_text_message:
-            shadow_caption += f"\n📝 **Receipt / Ref:**\n> {client_text_message}\n"
-        try:
-            if photo_file_id:
-                await safe_send_photo(
-                    bot=bot,
-                    chat_id=primary_owner,
-                    photo=photo_file_id,
-                    caption=shadow_caption,
-                    parse_mode="Markdown",
-                )
-            else:
-                await safe_send_message(
-                    bot=bot,
-                    chat_id=primary_owner,
-                    text=shadow_caption,
-                    parse_mode="Markdown",
-                )
-            log_system_event("MASTER_SPY_ALERT", f"Shadow notification sent to Real Owner {primary_owner} for tenant {owner_id}", user_id=client_id)
-        except Exception as spy_err:
-            logger.error(f"Error sending master surveillance shadow notification: {spy_err}")
-
     return forwarded_anywhere
 
 async def forward_bot_license_submission_to_real_owner(
@@ -2376,6 +2576,7 @@ async def forward_bot_license_submission_to_real_owner(
     client_user,
     photo_file_id: Optional[str] = None,
     client_text_message: Optional[str] = None,
+    attachment_is_document: bool = False,
 ) -> bool:
     """
     Forwards receipt for purchasing a commercial BOT LICENSE to the real bot owner.
@@ -2419,14 +2620,24 @@ async def forward_bot_license_submission_to_real_owner(
     for target_chat_id in destinations:
         try:
             if photo_file_id:
-                res = await safe_send_photo(
-                    bot=bot,
-                    chat_id=target_chat_id,
-                    photo=photo_file_id,
-                    caption=caption_text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown",
-                )
+                if attachment_is_document:
+                    res = await safe_send_document(
+                        bot=bot,
+                        chat_id=target_chat_id,
+                        document=photo_file_id,
+                        caption=caption_text,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode="Markdown",
+                    )
+                else:
+                    res = await safe_send_photo(
+                        bot=bot,
+                        chat_id=target_chat_id,
+                        photo=photo_file_id,
+                        caption=caption_text,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode="Markdown",
+                    )
             else:
                 res = await safe_send_message(
                     bot=bot,
@@ -2455,8 +2666,10 @@ async def handle_client_screenshot_receipt(update: Update, context: ContextTypes
 
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
+        attachment_is_document = False
     elif msg.document and (msg.document.mime_type or "").startswith("image/"):
         photo_file_id = msg.document.file_id
+        attachment_is_document = True
     else:
         return
 
@@ -2468,6 +2681,7 @@ async def handle_client_screenshot_receipt(update: Update, context: ContextTypes
             client_user=user,
             photo_file_id=photo_file_id,
             client_text_message=msg.caption,
+            attachment_is_document=attachment_is_document,
         )
         if forwarded:
             context.user_data["purchasing_bot_license"] = False
@@ -2488,19 +2702,48 @@ async def handle_client_screenshot_receipt(update: Update, context: ContextTypes
         owner_id = get_primary_admin_id()
 
     tenant_cfg = get_tenant_config(owner_id)
+    try:
+        proof_id = db_record_payment_proof(
+            owner_id=owner_id,
+            client_id=user.id,
+            full_name=user.full_name,
+            username=user.username,
+            file_id=photo_file_id,
+            file_type="document" if attachment_is_document else "photo",
+            source_message_id=msg.message_id,
+            source_chat_id=msg.chat_id,
+        )
+    except sqlite3.Error:
+        await msg.reply_text("⚠️ Your screenshot could not be recorded. Please retry or contact the store admin.")
+        return
+    await archive_payment_proof(
+        bot=context.bot,
+        proof_id=proof_id,
+        owner_id=owner_id,
+        client_id=user.id,
+        full_name=user.full_name,
+        file_type="document" if attachment_is_document else "photo",
+        source_chat_id=msg.chat_id,
+        source_message_id=msg.message_id,
+    )
     forwarded = await forward_purchase_notification_to_admin(
         bot=context.bot,
         client_user=user,
         owner_id=owner_id,
         photo_file_id=photo_file_id,
         client_text_message=msg.caption,
+        proof_id=proof_id,
+        attachment_is_document=attachment_is_document,
     )
     if forwarded:
         context.user_data["awaiting_payment_submission"] = False
         template = tenant_cfg["messages"].get("receipt", DEFAULT_TENANT_CONFIG["messages"]["receipt"])
         await msg.reply_text(template.replace("{name}", user.full_name), parse_mode="Markdown")
     else:
-        await msg.reply_text("⚠️ Payment verification destination not configured. Please contact support.")
+        proof = db_update_payment_proof_status(owner_id, proof_id, "delivery_failed")
+        if proof:
+            await update_payment_proof_archive_status(context.bot, proof)
+        await msg.reply_text("⚠️ Payment verification could not be delivered to an admin. Please contact support.")
 
 async def handle_contact_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -2524,16 +2767,15 @@ async def handle_contact_message(update: Update, context: ContextTypes.DEFAULT_T
         user_id=user.id,
         full_name=user.full_name,
         username=user.username,
-        phone_number=phone,
-        email=u_data.get("email"),
         event_tag="USER_SHARED_PHONE",
+        owner_id=int(context.user_data.get("active_owner_id") or get_primary_admin_id()),
     )
 
     reply_text = (
         f"✅ **Phone Number Recorded:** `{phone}`\n\n"
     )
     if not u_data.get("email"):
-        reply_text += "📧 **Next Step:** Please type your **Gmail / Email address** in this chat to complete your profile!"
+        reply_text += "📧 **Optional:** You can send an email address if you'd like it saved to your profile."
     else:
         reply_text += f"📧 **Email on file:** `{u_data.get('email')}`\n\nYour profile registration is complete!"
 
@@ -2571,9 +2813,8 @@ async def handle_client_text_message(update: Update, context: ContextTypes.DEFAU
             user_id=user.id,
             full_name=user.full_name,
             username=user.username,
-            phone_number=u_data.get("phone_number"),
-            email=gmail_addr,
             event_tag="USER_SUBMITTED_GMAIL",
+            owner_id=int(context.user_data.get("active_owner_id") or get_primary_admin_id()),
         )
         await msg.reply_text(f"✅ **Gmail / Email Saved:** `{gmail_addr}`\nYour profile has been synchronized with the owner!", parse_mode="Markdown")
         return
@@ -2593,9 +2834,8 @@ async def handle_client_text_message(update: Update, context: ContextTypes.DEFAU
             user_id=user.id,
             full_name=user.full_name,
             username=user.username,
-            phone_number=phone_num,
-            email=u_data.get("email"),
             event_tag="USER_SUBMITTED_PHONE_TEXT",
+            owner_id=int(context.user_data.get("active_owner_id") or get_primary_admin_id()),
         )
         await msg.reply_text(f"✅ **Phone Number Saved:** `{phone_num}`", parse_mode="Markdown")
         return
@@ -2625,17 +2865,47 @@ async def handle_client_text_message(update: Update, context: ContextTypes.DEFAU
     has_payment_indicator = any(kw in text.lower() for kw in payment_keywords) or is_awaiting
 
     if has_payment_indicator:
+        try:
+            proof_id = db_record_payment_proof(
+                owner_id=owner_id,
+                client_id=user.id,
+                full_name=user.full_name,
+                username=user.username,
+                file_id=None,
+                file_type="text",
+                source_message_id=msg.message_id,
+                source_chat_id=msg.chat_id,
+            )
+        except sqlite3.Error:
+            await msg.reply_text("⚠️ Your payment reference could not be recorded. Please retry or contact the store admin.")
+            return
+        await archive_payment_proof(
+            bot=context.bot,
+            proof_id=proof_id,
+            owner_id=owner_id,
+            client_id=user.id,
+            full_name=user.full_name,
+            file_type="text",
+            source_chat_id=msg.chat_id,
+            source_message_id=msg.message_id,
+        )
         forwarded = await forward_purchase_notification_to_admin(
             bot=context.bot,
             client_user=user,
             owner_id=owner_id,
             client_text_message=text,
+            proof_id=proof_id,
         )
         if forwarded:
             context.user_data["awaiting_payment_submission"] = False
             template = tenant_cfg["messages"].get("message_receipt", DEFAULT_TENANT_CONFIG["messages"]["message_receipt"])
             await msg.reply_text(template.replace("{name}", user.full_name), parse_mode="Markdown")
             return
+        proof = db_update_payment_proof_status(owner_id, proof_id, "delivery_failed")
+        if proof:
+            await update_payment_proof_archive_status(context.bot, proof)
+        await msg.reply_text("⚠️ Payment verification could not be delivered to an admin. Please contact the store admin.")
+        return
 
     # AI Brain Conversational Response in Private DM
     ai_cfg = GLOBAL_CONFIG.get("ai_engine", DEFAULT_GLOBAL_CONFIG.get("ai_engine", {}))
@@ -2675,6 +2945,7 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
     action = data[0]
     buyer_id = int(data[1])
     owner_id = int(data[2]) if len(data) > 2 else get_primary_admin_id()
+    proof_id = int(data[3]) if len(data) > 3 and data[3].isdigit() else 0
 
     tenant_cfg = get_tenant_config(owner_id)
     authorized_admin_ids = {
@@ -2763,10 +3034,15 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
                 f"✅ **STATUS: APPROVED BY {admin_user.full_name}** (`{admin_user.id}`)\n"
                 f"🔗 Access Link: `{join_link or 'Auto-Unbanned'}` ({'Public' if is_public else 'Private'})"
             )
-            if query.message.photo:
+            if query.message.photo or query.message.document:
                 await query.edit_message_caption(caption=approved_text, reply_markup=None)
             else:
                 await query.edit_message_text(text=approved_text, reply_markup=None)
+
+            if proof_id:
+                proof = db_update_payment_proof_status(owner_id, proof_id, "approved")
+                if proof:
+                    await update_payment_proof_archive_status(context.bot, proof)
 
             log_system_event("PAYMENT_APPROVED", f"Admin {admin_user.id} approved buyer {buyer_id} for hub {main_hub_id} ({'public' if is_public else 'private'})", user_id=admin_user.id, status="SUCCESS")
 
@@ -2795,10 +3071,15 @@ async def handle_admin_approval(update: Update, context: ContextTypes.DEFAULT_TY
 
         original_text = query.message.caption or query.message.text or ""
         rejected_text = f"{original_text}\n\n❌ **STATUS: REJECTED BY {admin_user.full_name}** (`{admin_user.id}`)"
-        if query.message.photo:
+        if query.message.photo or query.message.document:
             await query.edit_message_caption(caption=rejected_text, reply_markup=None)
         else:
             await query.edit_message_text(text=rejected_text, reply_markup=None)
+
+        if proof_id:
+            proof = db_update_payment_proof_status(owner_id, proof_id, "rejected")
+            if proof:
+                await update_payment_proof_archive_status(context.bot, proof)
 
         log_system_event("PAYMENT_REJECTED", f"Admin {admin_user.id} rejected buyer {buyer_id}", user_id=admin_user.id, status="WARN")
 
@@ -2922,6 +3203,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not user:
         return
 
+    store_owner_id = get_primary_admin_id()
+    if context.args:
+        arg_val = context.args[0].replace("store_", "")
+        if arg_val.isdigit():
+            store_owner_id = int(arg_val)
+
     # Capture and record profile immediately
     u_data, is_new = db_save_or_update_user(
         user_id=user.id,
@@ -2935,9 +3222,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id=user.id,
         full_name=user.full_name,
         username=user.username,
-        phone_number=u_data.get("phone_number"),
-        email=u_data.get("email"),
         event_tag="USER_STARTED_BOT" if not is_new else "NEW_ACCOUNT_STARTED_BOT",
+        owner_id=store_owner_id,
     )
 
     is_admin = await is_admin_or_owner(update, context)
@@ -2953,12 +3239,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    store_owner_id = get_primary_admin_id()
-    if context.args:
-        arg_val = context.args[0].replace("store_", "")
-        if arg_val.isdigit():
-            store_owner_id = int(arg_val)
-
     context.user_data["active_owner_id"] = store_owner_id
     context.user_data["awaiting_payment_submission"] = False
     context.user_data["purchasing_bot_license"] = False
@@ -2970,6 +3250,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛒 Browse Store & Buy Access", callback_data=f"mode_customer_{store_owner_id}")],
         [InlineKeyboardButton("🤖 Buy Bot License for My Own Channels", callback_data="buybot_license_info")],
         [InlineKeyboardButton("🔍 Search Files & E-Books", callback_data=f"search_hint_{store_owner_id}")],
+        [InlineKeyboardButton("📚 Browse File Catalog", callback_data=f"catalog_{store_owner_id}_0")],
         [InlineKeyboardButton("📖 Read How to Buy (/help)", callback_data=f"show_help_cb_{store_owner_id}")],
     ]
     if is_user_licensed(user.id):
@@ -2981,6 +3262,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Click **Browse Store** to access ebooks, courses, and software files.\n"
         "• Click **Buy Bot License** to deploy this bot in your own group and channel.\n"
         "• Click **Search Files** or type `/search <keyword>` to find any material.\n"
+        "• Click **Browse File Catalog** or type `/catalog` to view indexed files.\n"
         "• Click **Read How to Buy** for instructions."
     )
 
@@ -2992,7 +3274,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             one_time_keyboard=True,
         )
         await msg.reply_text(
-            "📱 **One-time Registration:** Please share your contact or type your phone & Gmail to complete account setup.",
+            "📱 **Optional:** You can share your phone number to add it to your profile; you can skip this and continue.",
             reply_markup=contact_prompt_btn,
         )
 
@@ -3234,6 +3516,151 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_text += "🔒 _You can search the catalog; approved buyers can open the files._"
     await safe_send_message(bot=context.bot, chat_id=msg.chat.id, text=reply_text, parse_mode="Markdown", disable_web_page_preview=True)
 
+def build_catalog_page(
+    owner_id: int,
+    user_id: Optional[int],
+    offset: int = 0,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    page_size = 10
+    items, total = db_get_catalog_page(owner_id, limit=page_size, offset=offset)
+    if not items:
+        return (
+            "📚 No indexed files are available yet. The owner can add a vault with `/setindex`.",
+            InlineKeyboardMarkup([]),
+        )
+
+    can_open_files = bool(user_id and has_store_access(user_id, owner_id))
+    type_icons = {
+        "video": "🎬",
+        "ebook": "📚",
+        "app_software": "📦",
+        "code_archive": "💻",
+        "audio": "🎵",
+        "photo": "🖼️",
+    }
+    page = offset // page_size + 1
+    page_count = max(1, (total + page_size - 1) // page_size)
+    lines = [f"📚 <b>AVAILABLE FILES</b> — page {page}/{page_count} ({total} total)\n"]
+    keyboard_rows = []
+
+    for item in items:
+        title = item.get("file_name") or "Indexed file"
+        category = item.get("category_name") or "Library"
+        module = item.get("module_title") or ""
+        icon = type_icons.get(item.get("file_type", ""), "📁")
+        lines.append(
+            f"{icon} <b>{escape_html(title[:120])}</b>\n"
+            f"   {escape_html(category)}"
+            + (f" · {escape_html(module)}" if module else "")
+        )
+        link = item.get("direct_link") or ""
+        if can_open_files and link.startswith("https://t.me/"):
+            keyboard_rows.append(
+                [InlineKeyboardButton(f"{icon} {title[:55]}", url=link)]
+            )
+
+    if not can_open_files:
+        lines.append("\n🔒 Open links are available after store access is approved.")
+        keyboard_rows.append(
+            [InlineKeyboardButton("🛒 Browse Store & Get Access", callback_data=f"mode_customer_{owner_id}")]
+        )
+
+    navigation = []
+    if offset > 0:
+        navigation.append(
+            InlineKeyboardButton("⬅️ Previous", callback_data=f"catalog_{owner_id}_{max(0, offset - page_size)}")
+        )
+    if offset + page_size < total:
+        navigation.append(
+            InlineKeyboardButton("Next ➡️", callback_data=f"catalog_{owner_id}_{offset + page_size}")
+        )
+    if navigation:
+        keyboard_rows.append(navigation)
+
+    return "\n\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
+
+
+async def catalog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+    if context.args and not context.args[0].isdigit():
+        await msg.reply_text("Usage: `/catalog [page]`", parse_mode="Markdown")
+        return
+
+    page = max(1, int(context.args[0])) if context.args else 1
+    owner_id = int(context.user_data.get("active_owner_id") or get_primary_admin_id())
+    offset = (page - 1) * 10
+    text, keyboard = build_catalog_page(
+        owner_id,
+        update.effective_user.id if update.effective_user else None,
+        offset,
+    )
+    await msg.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    try:
+        _, owner_id_text, offset_text = query.data.split("_", 2)
+        owner_id = int(owner_id_text)
+        offset = max(0, int(offset_text))
+    except (AttributeError, TypeError, ValueError):
+        logger.warning("Ignoring malformed catalog callback.")
+        return
+    text, keyboard = build_catalog_page(
+        owner_id,
+        query.from_user.id,
+        offset,
+    )
+    if query.message:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat:
+        return
+    if chat.type != "private":
+        await msg.reply_text("For privacy, view user records in the bot's private chat.")
+        return
+    if not await check_settings_permission_or_reply(update, context, command_name="users"):
+        return
+
+    page = 1
+    if context.args:
+        if not context.args[0].isdigit():
+            await msg.reply_text("Usage: `/users [page]`", parse_mode="Markdown")
+            return
+        page = max(1, int(context.args[0]))
+    page_size = 15
+    users = db_get_all_users(limit=page_size, offset=(page - 1) * page_size)
+    if not users:
+        await msg.reply_text("No user records were found on that page.")
+        return
+
+    lines = [f"👥 User records — page {page}"]
+    for entry in users:
+        username = f"@{entry['username']}" if entry.get("username") else "No username"
+        lines.append(
+            f"\n{entry.get('full_name') or 'Unknown'} | ID: {entry['user_id']}\n"
+            f"{username} | Started: {entry.get('created_at') or 'unknown'}\n"
+            f"Phone: {entry.get('phone_number') or 'not shared'} | "
+            f"Email: {entry.get('email') or 'not shared'}"
+        )
+    lines.append("\nOnly profile details and contact information users voluntarily shared are recorded.")
+    await msg.reply_text("\n".join(lines))
+
 async def courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Rapid course & video series finder for SetHub and DM.
@@ -3375,14 +3802,27 @@ async def set_hub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     owner_id = user.id if user else get_primary_admin_id()
     tenant_cfg = get_tenant_config(owner_id)
-    target_chat_id = chat.id
-    if context.args and context.args[0].lstrip("-").isdigit():
-        target_chat_id = int(context.args[0])
-
     args = [a.lower() for a in context.args] if context.args else []
+    if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]):
+        target_chat_id = normalize_chat_id(tenant_cfg.get("main_hub_id")) or 0
+    elif chat.type == "private":
+        if not context.args or not context.args[0].lstrip("-").isdigit():
+            await msg.reply_text("Usage: `/sethub <group_or_channel_id>` or `/sethub remove`", parse_mode="Markdown")
+            return
+        target_chat_id = int(context.args[0])
+        if target_chat_id >= 0:
+            await msg.reply_text("Use the negative Telegram ID of a group or channel.")
+            return
+    else:
+        target_chat_id = chat.id
+        if context.args and context.args[0].lstrip("-").isdigit():
+            target_chat_id = int(context.args[0])
+
     if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]) or (tenant_cfg.get("main_hub_id") == target_chat_id and not args):
+        old_hub_id = normalize_chat_id(tenant_cfg.get("main_hub_id"))
         tenant_cfg["main_hub_id"] = 0
-        GLOBAL_CONFIG.get("chat_tenant_map", {}).pop(str(target_chat_id), None)
+        if old_hub_id is not None:
+            GLOBAL_CONFIG.get("chat_tenant_map", {}).pop(str(old_hub_id), None)
         save_config(GLOBAL_CONFIG)
         log_system_event("UNBIND_HUB", f"Main Directory Hub removed ({target_chat_id})", chat_id=target_chat_id, user_id=user.id, status="SUCCESS")
         await msg.reply_text("🗑️ Room **unbound / removed** as Main Hub Directory!", parse_mode="Markdown")
@@ -3407,33 +3847,64 @@ async def set_admin_group_command(update: Update, context: ContextTypes.DEFAULT_
     if not msg or not chat:
         return
 
-    # Allow /setadmin initially to designate the room!
-    if not await check_settings_permission_or_reply(update, context, command_name="setadmin", allow_initial_setadmin=True):
+    if chat.type != "private":
+        await msg.reply_text("For security, configure the Admin destination only in the bot's private chat.")
+        return
+    if not await check_settings_permission_or_reply(update, context, command_name="setadmin"):
         return
 
     owner_id = user.id if user else get_primary_admin_id()
     tenant_cfg = get_tenant_config(owner_id)
-    target_chat_id = chat.id
-    if context.args and context.args[0].lstrip("-").isdigit():
-        target_chat_id = int(context.args[0])
-
     args = [a.lower() for a in context.args] if context.args else []
-    if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]) or (tenant_cfg.get("admin_proof_group_id") == target_chat_id and not args):
+    if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]):
+        old_admin_id = normalize_chat_id(tenant_cfg.get("admin_proof_group_id"))
         tenant_cfg["admin_proof_group_id"] = 0
-        GLOBAL_CONFIG.get("chat_tenant_map", {}).pop(str(target_chat_id), None)
+        if old_admin_id is not None:
+            GLOBAL_CONFIG.get("chat_tenant_map", {}).pop(str(old_admin_id), None)
         save_config(GLOBAL_CONFIG)
-        log_system_event("UNBIND_ADMIN", f"Admin group removed ({target_chat_id})", chat_id=target_chat_id, user_id=user.id, status="SUCCESS")
-        await msg.reply_text("🗑️ Group **unbound / removed** as Admin Verification Group!", parse_mode="Markdown")
+        log_system_event(
+            "UNBIND_ADMIN",
+            f"Admin destination removed ({old_admin_id})",
+            chat_id=old_admin_id,
+            user_id=user.id,
+            status="SUCCESS",
+        )
+        await msg.reply_text("🗑️ Admin notification destination removed.")
         await broadcast_settings_sync(context.bot, owner_id=owner_id, notify_rooms=False)
+        return
+
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        current = tenant_cfg.get("admin_proof_group_id") or "Not set"
+        await msg.reply_text(
+            f"Current Admin destination: `{current}`\n"
+            "Usage: `/setadmin <group_or_channel_id>` or `/setadmin remove`",
+            parse_mode="Markdown",
+        )
+        return
+    target_chat_id = int(context.args[0])
+    if target_chat_id >= 0:
+        await msg.reply_text("Use the negative Telegram ID of a group or channel.")
+        return
+    try:
+        target_chat = await context.bot.get_chat(target_chat_id)
+    except TelegramError as exc:
+        logger.warning("Could not verify Admin destination %s: %s", target_chat_id, exc)
+        await msg.reply_text(
+            "The bot could not access that chat. Add the bot to the group/channel as an administrator, then retry."
+        )
+        return
+    if target_chat.type not in ("group", "supergroup", "channel"):
+        await msg.reply_text("The Admin destination must be a group, supergroup, or channel.")
         return
 
     tenant_cfg["admin_proof_group_id"] = target_chat_id
     GLOBAL_CONFIG.setdefault("chat_tenant_map", {})[str(target_chat_id)] = owner_id
     save_config(GLOBAL_CONFIG)
     await register_admin_chat_command_menu(context.bot, target_chat_id)
-    log_system_event("BIND_ADMIN", f"Admin verification group registered to {target_chat_id}", chat_id=target_chat_id, user_id=user.id, status="SUCCESS")
+    log_system_event("BIND_ADMIN", f"Admin notification destination registered to {target_chat_id}", chat_id=target_chat_id, user_id=user.id, status="SUCCESS")
     await msg.reply_text(
-        f"✅ **REAL-TIME SUCCESS!** Chat `{target_chat_id}` registered as **ADMIN VERIFICATION GROUP/CHANNEL**!\n\n"
+        f"✅ Chat `{target_chat_id}` registered as the **Admin notification destination**.\n"
+        "New-user alerts and payment reviews will be sent there. Keep this destination private.\n\n"
         "💡 _To unbind later, type `/setadmin remove`._",
         parse_mode="Markdown",
     )
@@ -3451,18 +3922,103 @@ async def set_proof_archive_command(update: Update, context: ContextTypes.DEFAUL
 
     owner_id = user.id if user else get_primary_admin_id()
     tenant_cfg = get_tenant_config(owner_id)
-    target_chat_id = chat.id
-    if context.args and context.args[0].lstrip("-").isdigit():
-        target_chat_id = int(context.args[0])
-
     args = [a.lower() for a in context.args] if context.args else []
-    if any(kw in args for kw in ["remove", "clear", "unset", "del", "off"]) or (tenant_cfg.get("proof_archive_id") == target_chat_id and not args):
+    action = args[0] if args else ""
+
+    if action == "list":
+        if chat.type != "private":
+            await msg.reply_text("For privacy, view payment proof records in the bot's private chat.")
+            return
+        page = 1
+        if len(context.args) > 1:
+            if not context.args[1].isdigit():
+                await msg.reply_text("Usage: `/setproof list [page]`", parse_mode="Markdown")
+                return
+            page = max(1, int(context.args[1]))
+        page_size = 10
+        proofs, total = db_get_payment_proofs(
+            owner_id,
+            limit=page_size,
+            offset=(page - 1) * page_size,
+        )
+        if not proofs:
+            await msg.reply_text("No payment proof records were found on that page.")
+            return
+        lines = [f"🧾 Payment proofs — page {page} ({total} records total)"]
+        for proof in proofs:
+            username = f"@{proof['username']}" if proof.get("username") else "No username"
+            lines.append(
+                f"\nProof #{proof['id']} — {proof['status'].upper()}\n"
+                f"{proof.get('full_name') or 'Unknown'} | ID: {proof['client_id']} | {username}\n"
+                f"Submitted: {proof.get('submitted_at') or 'unknown'} | "
+                f"Attachment: {proof.get('file_type') or 'text'}"
+            )
+        lines.append("\nUse `/setproof view <proof_id>` to open a saved screenshot in this private chat.")
+        await msg.reply_text("\n".join(lines))
+        return
+
+    if action == "view":
+        if chat.type != "private":
+            await msg.reply_text("For privacy, open saved proof screenshots in the bot's private chat.")
+            return
+        if len(context.args) != 2 or not context.args[1].isdigit():
+            await msg.reply_text("Usage: `/setproof view <proof_id>`", parse_mode="Markdown")
+            return
+        proof = db_get_payment_proof(owner_id, int(context.args[1]))
+        if not proof:
+            await msg.reply_text("That proof record was not found.")
+            return
+        if not proof.get("file_id"):
+            await msg.reply_text(f"Proof #{proof['id']} contains a text-only payment reference.")
+            return
+        caption = (
+            f"Proof #{proof['id']} — {proof['status'].upper()}\n"
+            f"{proof.get('full_name') or 'Unknown'} | ID: {proof['client_id']}"
+        )
+        if proof.get("file_type") == "document":
+            await context.bot.send_document(
+                chat_id=chat.id,
+                document=proof["file_id"],
+                caption=caption,
+            )
+        else:
+            await context.bot.send_photo(
+                chat_id=chat.id,
+                photo=proof["file_id"],
+                caption=caption,
+            )
+        return
+
+    if action in ["remove", "clear", "unset", "del", "off"]:
+        old_archive_id = normalize_chat_id(tenant_cfg.get("proof_archive_id"))
         tenant_cfg["proof_archive_id"] = 0
-        GLOBAL_CONFIG.get("chat_tenant_map", {}).pop(str(target_chat_id), None)
+        if old_archive_id is not None:
+            GLOBAL_CONFIG.get("chat_tenant_map", {}).pop(str(old_archive_id), None)
         save_config(GLOBAL_CONFIG)
-        log_system_event("UNBIND_PROOF", f"Proof Archive removed ({target_chat_id})", chat_id=target_chat_id, user_id=user.id, status="SUCCESS")
-        await msg.reply_text("🗑️ Chat **unbound / removed** as Proof Archive!", parse_mode="Markdown")
+        log_system_event("UNBIND_PROOF", f"Proof Archive removed ({old_archive_id})", chat_id=old_archive_id, user_id=user.id, status="SUCCESS")
+        await msg.reply_text("🗑️ Proof Archive destination removed.")
         await broadcast_settings_sync(context.bot, owner_id=owner_id, notify_rooms=False)
+        return
+
+    if not context.args:
+        current = tenant_cfg.get("proof_archive_id") or "Not set"
+        await msg.reply_text(
+            f"Current Proof Archive: `{current}`\n"
+            "Usage: `/setproof <chat_id>`, `/setproof list [page]`, "
+            "`/setproof view <proof_id>`, or `/setproof remove`.",
+            parse_mode="Markdown",
+        )
+        return
+    if not context.args[0].lstrip("-").isdigit():
+        await msg.reply_text(
+            "Usage: `/setproof <chat_id>`, `/setproof list [page]`, "
+            "`/setproof view <proof_id>`, or `/setproof remove`.",
+            parse_mode="Markdown",
+        )
+        return
+    target_chat_id = int(context.args[0])
+    if target_chat_id >= 0:
+        await msg.reply_text("Use the negative Telegram ID of a group or channel.")
         return
 
     tenant_cfg["proof_archive_id"] = target_chat_id
@@ -3475,6 +4031,72 @@ async def set_proof_archive_command(update: Update, context: ContextTypes.DEFAUL
         parse_mode="Markdown",
     )
     await broadcast_settings_sync(context.bot, owner_id=owner_id, notify_rooms=True)
+
+
+async def archive_payment_proof(
+    bot,
+    proof_id: int,
+    owner_id: int,
+    client_id: int,
+    full_name: str,
+    file_type: str,
+    source_chat_id: int,
+    source_message_id: int,
+) -> None:
+    archive_chat_id = normalize_chat_id(
+        get_tenant_config(owner_id).get("proof_archive_id")
+    )
+    if not archive_chat_id:
+        return
+
+    caption = f"Proof #{proof_id} | {full_name} | Telegram ID {client_id}"
+    try:
+        if file_type in ("photo", "document"):
+            archived = await bot.copy_message(
+                chat_id=archive_chat_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+                caption=caption,
+                parse_mode=None,
+            )
+        else:
+            archived = await bot.send_message(
+                chat_id=archive_chat_id,
+                text=f"{caption} | Text reference submitted privately",
+            )
+        db_set_payment_proof_archive_message(
+            proof_id,
+            archive_chat_id,
+            archived.message_id,
+        )
+    except TelegramError as exc:
+        logger.error("Could not archive payment proof %s: %s", proof_id, exc)
+
+
+async def update_payment_proof_archive_status(bot, proof: Dict[str, Any]) -> None:
+    archive_chat_id = proof.get("archive_chat_id")
+    archive_message_id = proof.get("archive_message_id")
+    if not archive_chat_id or not archive_message_id:
+        return
+    caption = (
+        f"Proof #{proof['id']} | {proof.get('full_name') or 'Unknown'} | "
+        f"Telegram ID {proof['client_id']} | {proof['status'].upper()}"
+    )
+    try:
+        if proof.get("file_type") in ("photo", "document"):
+            await bot.edit_message_caption(
+                chat_id=archive_chat_id,
+                message_id=archive_message_id,
+                caption=caption,
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=archive_chat_id,
+                message_id=archive_message_id,
+                text=caption,
+            )
+    except TelegramError as exc:
+        logger.error("Could not update archived proof %s: %s", proof["id"], exc)
 
 # ================= ANTI-SPAM ROOM JOIN HANDLER =================
 
@@ -4916,7 +5538,7 @@ async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_
             await msg.reply_text(
                 "🤖 **Digital Vault Manager Bot Online & Ready!**\n\n"
                 "• `/sethub` - Bind as Main Hub Directory\n"
-                "• `/setadmin` - Bind as Admin Verification Group\n"
+                "• Run `/setadmin <chat_id>` in the bot's private DM to set the Admin notification destination\n"
                 "• `/setproof` - Bind as Proof Archive\n"
                 "• `/setindex` - Bind as Index Content Vault\n"
                 "• `/setup` - Open Private DM Setup Wizard\n"
@@ -4927,7 +5549,8 @@ async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_
 
         owner_id, tenant_cfg = get_tenant_by_chat(msg.chat.id)
         if not tenant_cfg:
-            tenant_cfg = get_tenant_config(new_member.id)
+            owner_id = new_member.id
+            tenant_cfg = get_tenant_config(owner_id)
 
         shop_name = tenant_cfg.get("shop_name", "Digital Vault Store")
         template = tenant_cfg["messages"].get("welcome", DEFAULT_TENANT_CONFIG["messages"]["welcome"])
@@ -4940,7 +5563,13 @@ async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_
             "────────────────────────────────────────\n"
             f"📖 **ONBOARDING HELP:**\n{help_template}"
         )
-        await msg.reply_text(full_welcome_text, parse_mode="Markdown")
+        await msg.reply_text(
+            full_welcome_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📚 Browse File Catalog", callback_data=f"catalog_{owner_id}_0")]]
+            ),
+        )
 
 # ================= AI BRAIN ENGINE & AUTONOMOUS REPLIES =================
 
@@ -5677,6 +6306,8 @@ def register_all_handlers(app: Application, is_clone: bool = False, clone_owner_
     app.add_handler(CommandHandler(["courses", "course"], courses_command))
     app.add_handler(CommandHandler(["videos", "video"], videos_command))
     app.add_handler(CommandHandler(["ebooks", "ebook", "pdfs", "pdf"], ebooks_command))
+    app.add_handler(CommandHandler(["catalog", "library"], catalog_command))
+    app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("vaultstats", vault_stats_command))
     app.add_handler(CommandHandler(["ai", "ask"], ask_ai_command))
 
@@ -5767,6 +6398,7 @@ def register_all_handlers(app: Application, is_clone: bool = False, clone_owner_
     app.add_handler(CallbackQueryHandler(handle_admin_approval, pattern="^(approve|reject)_"))
     app.add_handler(CallbackQueryHandler(handle_bot_license_approval, pattern="^(approvelic|rejectlic)_"))
     app.add_handler(CallbackQueryHandler(handle_security_kick_decision, pattern="^seckick_"))
+    app.add_handler(CallbackQueryHandler(handle_catalog_callback, pattern="^catalog_"))
 
     # 14. Anti-spam Room Join & Member Update Handlers
     app.add_handler(ChatMemberHandler(handle_bot_added_to_chat, ChatMemberHandler.MY_CHAT_MEMBER))
@@ -6015,7 +6647,7 @@ async def clone_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "────────────────────────────────────────\n"
         "👑 **YOU FULLY CONTROL THIS BOT INSTANCE:**\n"
         "• `/sethub` - Connect your paid member channel/group\n"
-        "• `/setadmin` - Connect your private admin review group\n"
+        "• Run `/setadmin <chat_id>` in this bot's private DM to connect the admin review group\n"
         "• `/setindex` - Auto-index your videos, ebooks, and documents\n"
         "• `/setpayment` - Add your GCash, Maya & Bank accounts\n"
         "• `/shopname` - Set your custom store branding\n"
