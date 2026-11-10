@@ -97,30 +97,29 @@ DEFAULT_TENANT_CONFIG: Dict[str, Any] = {
         "pay_bank": "🏦 **MariBank / Bank Transfer**\nAccount Number: `1234-5678-9012`\nBank: MariBank\nAccount Name: Admin",
     },
     "messages": {
-        "welcome": "👋 **Welcome to {shop_name}, {name}!**\n\nGet access to our complete library of courses, ebooks, software, and files.\n\nPlease select your preferred payment method below:",
+        "welcome": "👋 **Welcome to {shop_name}, {name}!**\n\nBrowse our courses, ebooks, software, and files with `/catalog` or `/library`, or search with `/search <keyword>`. For checkout, open `/start` in a private chat with this bot.",
         "help": (
-            "📖 **MEMBER GUIDE: HOW TO BUY & USE THE DIGITAL VAULT**\n\n"
+            "📖 **MEMBER GUIDE: HOW TO USE THE DIGITAL VAULT**\n\n"
             "Welcome **{name}** to **{shop_name}**!\n\n"
-            "ℹ️ **ACCESS POLICY & RULES:**\n"
-            "• **Members:** You are permitted to use `/start` (to checkout) and `/help` (for instructions).\n"
-            "• **Admins & Owners:** Store and hub controls are locked to verified Administrators and can generally be run in Bot Private DM or your configured SetAdmin group/channel. Configure or remove the Admin destination only with `/setadmin` in Bot Private DM. In a channel, any admin who can publish posts can run available commands because Telegram does not identify the individual poster; commands and replies are visible to channel subscribers. Do not enter passwords, API keys, or other secrets in channel commands. Add the bot as a channel administrator, then set it up with `/setadmin <channel_id>` in Bot Private DM.\n\n"
             "─── 🛒 **STEP-BY-STEP PURCHASING GUIDE** ───\n"
             "1️⃣ **Start Checkout:** Type `/start` in private DM.\n"
-            "2️⃣ **Select Payment Method:** Choose GCash, Maya, Bank Transfer, or Crypto.\n"
+            "2️⃣ **Select Payment Method:** Choose one of the payment methods shown by the store.\n"
             "3️⃣ **Make Transfer:** Send exact amount using provided account details.\n"
-            "4️⃣ **Submit Receipt:** Send photo/screenshot or transaction reference number directly here.\n"
-            "5️⃣ **Receive Single-Use Link:** Once verified by admin, you will receive a single-use invite link to the Main Directory Hub!\n\n"
-            "─── 🤖 **WANT TO USE THIS BOT IN YOUR OWN GROUP/CHANNEL?** ───\n"
-            "• Bot deployment for your own group/channel is a **paid feature**.\n"
-            "• Type `/start` and select '🤖 Buy Bot License' to purchase full access!\n\n"
-            "─── 📚 **SEARCHING MATERIALS** ───\n"
-            "• Search indexed files anytime using `/search <keyword>`.\n\n"
-            "─── ⚙️ **STORE OWNERS & MANAGERS** ───\n"
-            "• Type `/setup` in private DM to open the Setup Wizard.\n"
-            "• Type `/admin` in private DM or in SetAdmin group to open Admin Control Desk."
+            "4️⃣ **Submit Proof:** Send your receipt screenshot or transaction reference in this private chat.\n"
+            "5️⃣ **Wait for Review:** The store admin will review your submission and message you with the access details.\n\n"
+            "─── 📚 **BROWSE & FIND FILES** ───\n"
+            "• `/catalog` or `/library` — Browse the indexed file titles and categories.\n"
+            "• `/search <keyword>` — Find a file by title or topic.\n"
+            "• `/courses`, `/videos`, `/ebooks` — Browse indexed media by type.\n"
+            "• `/vaultstats` — View library counts.\n"
+            "• Approved file links are available in your private chat with this bot.\n\n"
+            "─── ℹ️ **MORE HELP** ───\n"
+            "• `/start` — Open the store and checkout options.\n"
+            "• `/help` — Show this guide again.\n"
+            "• Share a phone number or email only if you choose; it is optional."
         ),
-        "receipt": "⌛ **Receipt Submitted!**\n\nThank you {name}. Your payment submission has been forwarded to our admin team for verification. Once approved, you will automatically receive your single-use invite link here!",
-        "message_receipt": "⌛ **Payment Details Received!**\n\nThank you {name}. Your transaction message has been forwarded to our admin team for verification. Once approved, you will automatically receive your invite link here!",
+        "receipt": "⌛ **Receipt Submitted!**\n\nThank you {name}. Your payment submission has been forwarded to our admin team for verification. Once reviewed, we will message you here with your hub access details.",
+        "message_receipt": "⌛ **Payment Details Received!**\n\nThank you {name}. Your transaction message has been forwarded to our admin team for verification. Once reviewed, we will message you here with your hub access details.",
     },
     "moderation": {
         "enabled": True,
@@ -3172,23 +3171,27 @@ async def handle_bot_license_approval(update: Update, context: ContextTypes.DEFA
             f"1️⃣ **ADD BOT TO YOUR CHANNELS & GROUPS AS ADMIN:**\n"
             f"• Add @{bot_info.username} to your target Group or Channel.\n"
             "• Grant **Administrator Permissions** (Post Messages, Edit Messages, Delete Messages, Invite Users via Link).\n\n"
-            "2️⃣ **BIND YOUR ROOMS (Only in DM or in your SetAdmin room):**\n"
+            "2️⃣ **BIND YOUR ROOMS (Run room setup commands in Bot DM):**\n"
             "• 📍 **Main Directory Hub:** Run `/sethub <chat_id>` (Where new course modules and updates are posted).\n"
-            "• 📍 **Admin Verification Group:** Run `/setadmin <chat_id>` (Where customer payment screenshots and approve/reject cards arrive).\n"
-            "• 📍 **Proof Archive:** Run `/setproof <chat_id>` (Where approved payment screenshots are archived).\n"
-            "• 📚 **Index Content Vault:** Run `/setindex <chat_id>` (Where you upload your ebooks, videos, APKs, and documents).\n\n"
+            "• 📍 **Admin Destination:** Run `/setadmin <chat_id>` in Bot DM (This command is private-chat-only; payment reviews and user alerts arrive there).\n"
+            "• 📍 **Proof Archive:** Run `/setproof <chat_id>` (Stores submitted screenshot and text-reference records).\n"
+            "• 📚 **Index Content Vault:** Run `/setindex <chat_id> [start_id] [end_id]` (Registers media and optionally scans the specified history range).\n\n"
             "3️⃣ **AUTO-INDEX YOUR CHANNEL MEDIA HISTORY:**\n"
-            "• Run `/setindex <chat_id>` from DM or your SetAdmin room.\n"
-            "• The bot automatically scans past posts, categorizes videos, ebooks, PDFs, APKs, and saves them to the database!\n"
-            "• Real-time search is instantly active for your members via `/search <keyword>`.\n"
-            "• To unbind a vault later, type `/setindex remove <chat_id>`.\n\n"
-            "4️⃣ **CONFIGURE YOUR OWN STORE & PAYMENTS:**\n"
+            "• If the vault is also your configured Admin room, run `/setindex` there to scan through the current post. Otherwise, from Bot DM use `/setindex <chat_id> <start_id> <end_id>` with known message IDs; DM cannot discover the latest post ID automatically.\n"
+            "• `/setindex status` and `/setindex stop` report or halt a scan.\n"
+            "• Members can browse with `/catalog` or `/library`, search via `/search <keyword>`, and use `/courses`, `/videos`, or `/ebooks`.\n"
+            "• Approved file links are shown in private chats. Unbind with `/unsetindex <chat_id>` (DM) or `/setindex remove` in the configured Admin room.\n\n"
+            "4️⃣ **USER & PAYMENT RECORDS:**\n"
+            "• `/setproof list [page]` and `/setproof view <proof_id>` review submitted payment proofs in private DM.\n"
+            "• `/users [page]` shows profile records to the bot owner only.\n"
+            "• Profile notifications go to the configured Admin destination; phone/email sharing is optional.\n\n"
+            "5️⃣ **CONFIGURE YOUR OWN STORE & PAYMENTS:**\n"
             "• `/shopname <Your Store Name>` - Set your custom store branding.\n"
             "• `/setpayment gcash <Number> | <Name>` - Configure your GCash.\n"
             "• `/setpayment maya <Number> | <Name>` - Configure your Maya.\n"
             "• `/setpayment bank <Account> | <Bank> | <Name>` - Set bank account.\n"
             "• `/addpayment crypto <Label> | <Details>` - Add USDT/crypto.\n\n"
-            "5️⃣ **MANAGE WITH SETUP WIZARD & ADMIN DESK:**\n"
+            "6️⃣ **MANAGE WITH SETUP WIZARD & ADMIN DESK:**\n"
             f"• Open private DM with @{bot_info.username} and run `/setup` for the Interactive Control Panel.\n"
             "• Run `/admin` to view all available owner tools.\n"
             "• Run `/reload sync` to test connectivity across all your connected rooms.\n"
@@ -3257,7 +3260,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ℹ️ **ADMIN NOTICE**\n\n"
             "Member checkout (`/start`) is hidden for admins in group chats.\n"
             "• Type `/setup` in private DM to open your **Full Setup Wizard**.\n"
-            "• Type `/admin` in private DM or in SetAdmin group to open **Admin Control Panel**.",
+            "• Type `/admin` in private DM or a configured Admin room to open **Admin Control Panel**.",
             parse_mode="Markdown",
         )
         return
@@ -3317,7 +3320,7 @@ async def member_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             "ℹ️ **ADMIN NOTICE**\n\n"
             "Member help (`/help`) is hidden for Admins in group chats.\n"
             "• Type `/setup` in private DM to open your **Full Setup Wizard**.\n"
-            "• Type `/admin` in private DM or in SetAdmin group to open **Admin Control Panel**.",
+            "• Type `/admin` in private DM or a configured admin room to open **Admin Control Panel**.",
             parse_mode="Markdown",
         )
         return
@@ -3331,6 +3334,7 @@ async def member_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("🛒 Start Buying & Checkout Now", callback_data=f"mode_customer_{store_owner_id}")],
         [InlineKeyboardButton("🤖 Buy Bot License for My Channels", callback_data="buybot_license_info")],
         [InlineKeyboardButton("🔍 Search Vault Library", callback_data=f"search_hint_{store_owner_id}")],
+        [InlineKeyboardButton("📚 Browse File Catalog", callback_data=f"catalog_{store_owner_id}_0")],
     ]
     if is_user_licensed(user.id):
         keyboard.append([InlineKeyboardButton("⚙️ Manager Setup Wizard", callback_data=f"setup_main_{user.id}")])
@@ -4231,7 +4235,7 @@ async def handle_bot_added_to_chat(update: Update, context: ContextTypes.DEFAULT
 
     dm_keyboard = [
         [InlineKeyboardButton("📍 Set as Main Directory Hub", callback_data=f"bindroom_hub_{chat.id}")],
-        [InlineKeyboardButton("📍 Set as Admin Verification Group", callback_data=f"bindroom_admin_{chat.id}")],
+        [InlineKeyboardButton("📍 Set as Admin Notification Destination", callback_data=f"bindroom_admin_{chat.id}")],
         [InlineKeyboardButton("📍 Set as Proof Archive", callback_data=f"bindroom_proof_{chat.id}")],
         [InlineKeyboardButton("📚 Set as Index Content Vault (/setindex)", callback_data=f"bindroom_index_{chat.id}")],
         [InlineKeyboardButton("⚙️ Open DM Setup Wizard", callback_data=f"setup_main_{installer.id}")],
@@ -4268,7 +4272,7 @@ async def handle_bind_room_callback(update: Update, context: ContextTypes.DEFAUL
         role_label = "MAIN DIRECTORY HUB"
     elif role == "admin":
         tenant_cfg["admin_proof_group_id"] = chat_id
-        role_label = "ADMIN VERIFICATION GROUP"
+        role_label = "ADMIN NOTIFICATION DESTINATION"
     elif role == "proof":
         tenant_cfg["proof_archive_id"] = chat_id
         role_label = "PROOF ARCHIVE"
@@ -4518,7 +4522,7 @@ async def setup_wizard_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"👥 **Co-Owners:** `{len(co_owners)} registered`\n\n"
         "📋 **ACTIVE ROOM STATUS:**\n"
         f"• 📍 **Main Directory Hub:** `{hub_id if hub_id else 'Not Set'}`\n"
-        f"• 📍 **Admin Verification Group:** `{admin_id if admin_id else 'Not Set'}`\n"
+        f"• 📍 **Admin Notification Destination:** `{admin_id if admin_id else 'Not Set'}`\n"
         f"• 📍 **Proof Archive:** `{proof_id if proof_id else 'Not Set'}`\n"
         f"• 📚 **Index Content Vaults:** `{len(tenant_cfg.get('index_vault_ids', []))} rooms`\n\n"
         "────────────────────────────────────────\n"
@@ -4547,13 +4551,15 @@ async def handle_setup_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             "🏨 **ROOM BINDING SETUP GUIDE**\n\n"
             "To assign room roles:\n"
             "1️⃣ Add this bot as an **Admin** in your target group or channel.\n"
-            "2️⃣ Or run commands directly in Bot DM or in SetAdmin group:\n"
-            "   • `/sethub <chat_id>` (Where lessons are broadcast)\n"
-            "   • `/setadmin <chat_id>` (Where purchase cards arrive)\n"
-            "   • `/setproof <chat_id>` (Where proofs are saved)\n"
-            "   • `/setindex <chat_id>` (To auto-index all past media)\n\n"
+            "2️⃣ Configure the rooms in Bot DM using:\n"
+            "   • `/sethub <chat_id>` — Paid member hub/directory\n"
+            "   • `/setadmin <chat_id>` — Private admin notification and payment-review destination (DM-only)\n"
+            "   • `/setproof <chat_id>` — Proof archive for submitted screenshots and references\n"
+            "   • `/setindex <chat_id> [start_id] [end_id]` — Index a vault and optionally scan a message range\n"
+            "   • `/unsethub`, `/unsetadmin`, `/unsetproof`, `/unsetindex <chat_id>` — Remove the matching binding\n"
+            "   • `/setproof list` and `/setproof view <proof_id>` — Review saved proofs in Bot DM\n\n"
             f"📍 Main Hub: `{hub_id}`\n"
-            f"📍 Admin Verification: `{admin_id}`\n"
+            f"📍 Admin Notification Destination: `{admin_id}`\n"
             f"📍 Proof Archive: `{proof_id}`\n"
             f"📚 Index Vaults: `{vaults}`"
         )
@@ -4575,7 +4581,7 @@ async def handle_setup_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             "• `/addcoowner <USER_ID>` - Add co-owner\n"
             "• `/delcoowner <USER_ID>` - Remove co-owner\n"
             "• `/renameowner <USER_ID> <Label>` - Label User ID\n"
-            "• `/setadminid <USER_ID>` - Set global admin ID"
+            "• `/users [page]` - View registered profiles; available only to the bot owner."
         )
         keyboard = [[InlineKeyboardButton("🔙 Back to Setup Wizard", callback_data=f"setup_main_{user.id}")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -4701,7 +4707,7 @@ async def handle_setup_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             f"👥 **Co-Owners:** `{len(co_owners)} registered`\n\n"
             "📋 **ACTIVE ROOM STATUS:**\n"
             f"• 📍 **Main Directory Hub:** `{hub_id if hub_id else 'Not Set'}`\n"
-            f"• 📍 **Admin Verification Group:** `{admin_id if admin_id else 'Not Set'}`\n"
+            f"• 📍 **Admin Notification Destination:** `{admin_id if admin_id else 'Not Set'}`\n"
             f"• 📍 **Proof Archive:** `{proof_id if proof_id else 'Not Set'}`\n"
             f"• 📚 **Index Content Vaults:** `{len(tenant_cfg.get('index_vault_ids', []))} rooms`\n\n"
             "────────────────────────────────────────\n"
@@ -4820,7 +4826,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_help_text = (
         f"🛠️ **ADMIN CONTROL DESK: {shop_name}**\n\n"
-        "🔒 **Settings Location Rule:** Configuration can ONLY be changed in DM or SetAdmin group!\n"
+        "🔒 **Settings Location Rule:** Most configuration can be changed in Bot DM or the configured Admin room. `/setadmin` and its removal aliases are Bot-DM-only. Channel commands and replies are public; Telegram does not identify which channel administrator posted them.\n"
         f"👑 **Commercial License:** {license_status}\n\n"
         "🔄 **Reload & Live Sync:**\n"
         "• `/reload` - Reloads config & database\n"
@@ -4830,17 +4836,22 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ **Full Setup Wizard:**\n"
         "• `/setup` - Interactive Control Panel inside private DM\n\n"
         "👤 **User ID & Store Management:**\n"
-        "• `/setadminid <ID>` - Configure global Admin Telegram ID\n"
         "• `/setowner <ID>` - Transfer primary store owner ID\n"
         "• `/addcoowner <ID>` | `/delcoowner <ID>` - Manage co-owners\n"
         "• `/renameowner <ID> <Label>` | `/shopname <Name>` - Rename labels\n\n"
         "📍 **Room Binding & Indexing:**\n"
-        "• `/setindex` (or `/setindex remove`) - Bind/Unbind Index Content Vault\n"
+        "• `/setindex <chat_id> [start_id] [end_id]` - Bind a vault; optionally scan a known history range\n"
+        "• `/setindex status` | `/setindex stop` - Check or stop a history scan\n"
+        "• `/unsetindex <chat_id>` (or `/setindex remove`) - Unbind an Index Content Vault\n"
         "• `/sethub` (or `/sethub remove`) - Bind/Unbind Main Hub Directory\n"
-        "• `/setadmin` (or `/setadmin remove`) - Bind/Unbind Admin Review Group\n"
-        "• `/setproof` (or `/setproof remove`) - Bind/Unbind Proof Archive\n\n"
+        "• `/setadmin <chat_id>` (Bot DM only) | `/unsetadmin` - Set/remove Admin notifications and payment reviews\n"
+        "• `/setproof <chat_id>` | `/unsetproof` - Set/remove proof archive\n"
+        "• `/setproof list [page]` | `/setproof view <proof_id>` - Review proof records privately\n"
+        "• `/unsethub` - Remove Main Hub Directory\n\n"
         "🔍 **File, Video & Index Tools:**\n"
         "• `/search <keyword>` - Rapid SQLite file search\n"
+        "• `/catalog` | `/library` - Browse indexed files by title and category; approved links appear in private chat\n"
+        "• `/courses` | `/videos` | `/ebooks` - Browse indexed media by type\n"
         "• `/vaultstats` - Database metrics and indexed files count\n"
         "• `/viewvault` - Inspect all uploaded modules and files\n"
         "• `/openlink <link>` - Inspect Telegram jump links\n"
@@ -4856,6 +4867,9 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/addbadword <word>` - Add word to auto-moderation blocklist\n"
         "• `/promote <Text>` - Broadcast message\n"
         "• `/config` - View active configuration audit\n\n"
+        "👥 **User & Proof Records:**\n"
+        "• `/users [page]` - Private user profile report (bot owner only)\n"
+        "• `/setproof list [page]` | `/setproof view <proof_id>` - View payment proof records privately\n\n"
         "🧠 **AI Brain Control & Persona:**\n"
         "• `/setai <gemini|openai|openrouter|custom> <KEY> [model] [base_url]`\n"
         "• `/setaiprompt <instructions...>` - Set female AI persona & response style\n"
@@ -4868,8 +4882,11 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/clonebot <TOKEN>` (or `/setclonetoken`) - Spawn dedicated bot clone with your token\n"
         "• `/mybot` - View your cloned bot status & webhook health\n\n"
     )
+    owner_help_text = ""
     if user and is_super_admin(user.id):
-        admin_help_text += (
+        owner_help_text = (
+            "👑 **Real Owner Configuration:**\n"
+            "• `/setadminid <ID>` | `/adminid <ID>` - Change the global Admin ID (Bot DM only)\n"
             "👑 **Real Owner Bot Licensing:**\n"
             "• `/grantlicense <USER_ID>` - Grant commercial license\n"
             "• `/revokelicense <USER_ID>` - Revoke commercial license\n"
@@ -4893,6 +4910,16 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if sent_message is None:
             await msg.reply_text("I couldn't send the admin panel. Please try again in a moment.")
+            return
+        if owner_help_text:
+            owner_message = await safe_send_message(
+                bot=context.bot,
+                chat_id=chat.id,
+                text=owner_help_text,
+                parse_mode="Markdown",
+            )
+            if owner_message is None:
+                await msg.reply_text("The bot-owner command list could not be sent. Please try `/admin` again.")
         return
 
     sent_message = await safe_send_message(
@@ -4905,6 +4932,17 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Could not send admin panel to user %s.", requester_id)
         await msg.reply_text("Please start a private chat with this bot, then run `/admin` there.")
         return
+    if owner_help_text:
+        owner_message = await safe_send_message(
+            bot=context.bot,
+            chat_id=requester_id,
+            text=owner_help_text,
+            parse_mode="Markdown",
+        )
+        if owner_message is None:
+            logger.error("Could not send bot-owner command list to user %s.", requester_id)
+            await msg.reply_text("The bot-owner command list could not be sent. Please try `/admin` again.")
+            return
     if user:
         await msg.reply_text("✅ I sent the admin panel to your private chat.")
     else:
@@ -5609,12 +5647,15 @@ async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_
             log_system_event("BOT_ADDED_GROUP", f"Bot joined {msg.chat.title} ({msg.chat.id})", chat_id=msg.chat.id)
             await msg.reply_text(
                 "🤖 **Digital Vault Manager Bot Online & Ready!**\n\n"
-                "• `/sethub` - Bind as Main Hub Directory\n"
-                "• Run `/setadmin <chat_id>` in the bot's private DM to set the Admin notification destination\n"
-                "• `/setproof` - Bind as Proof Archive\n"
-                "• `/setindex` - Bind as Index Content Vault\n"
-                "• `/setup` - Open Private DM Setup Wizard\n"
-                "• `/reload` | `/showlog` - System sync and logs",
+                "Configure room bindings from the bot's private chat:\n"
+                "• `/sethub <chat_id>` - Set the paid member hub\n"
+                "• `/setadmin <chat_id>` - Set the private Admin notification/payment-review destination (DM-only)\n"
+                "• `/setproof <chat_id>` - Set the proof archive; use `/setproof list` and `/setproof view <proof_id>` privately to review records\n"
+                "• `/setindex <chat_id> [start_id] [end_id]` - Bind a content vault and optionally scan a message range\n"
+                "• `/unsethub`, `/unsetadmin`, `/unsetproof`, `/unsetindex <chat_id>` - Remove room bindings\n"
+                "• `/setup` - Open the private DM Setup Wizard; `/admin` - Open the Admin Control Desk\n"
+                "Members can use `/catalog` or `/library`, `/search <keyword>`, `/courses`, `/videos`, and `/ebooks`.\n"
+                "Bot-owner only: `/users [page]` lists registered user profiles.",
                 parse_mode="Markdown",
             )
             continue
@@ -6175,7 +6216,7 @@ async def master_view_tenant_command(update: Update, context: ContextTypes.DEFAU
         f"👥 **Co-Owners ({len(t_cfg.get('co_owners', []))}):** `{t_cfg.get('co_owners')}`\n\n"
         f"🏨 **CONNECTED ROOMS:**\n"
         f"• 📍 Main Hub ID: `{t_cfg.get('main_hub_id') or 'Not Set'}`\n"
-        f"• 📍 Admin Group ID: `{t_cfg.get('admin_proof_group_id') or 'Not Set'}`\n"
+        f"• 📍 Admin Notification Destination ID: `{t_cfg.get('admin_proof_group_id') or 'Not Set'}`\n"
         f"• 📍 Proof Archive ID: `{t_cfg.get('proof_archive_id') or 'Not Set'}`\n"
         f"• 📚 Index Vaults ({len(vault_rooms)}): `{vault_rooms}`\n\n"
         f"💳 **Configured Payment Options:** `{', '.join(pay_list) if pay_list else 'None'}`\n"
